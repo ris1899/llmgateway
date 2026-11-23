@@ -1,6 +1,4 @@
-// Package api is the HTTP edge: routing, middleware, OpenAI-shaped errors and
-// SSE. It holds no routing logic; handlers decode, call into the gateway
-// package, and encode.
+// Package api is the HTTP edge: decode, call into gateway, encode.
 package api
 
 import (
@@ -20,17 +18,14 @@ import (
 )
 
 type Deps struct {
-	Log          *slog.Logger
-	Gateway      *gateway.Gateway
-	Metrics      *metrics.Metrics
-	Usage        usage.Sink
-	Auth         *auth.Store        // nil = auth disabled
-	Limiter      *ratelimit.Limiter // nil = no rate limits / spend caps
-	MaxBodyBytes int64
-	// RequestTimeout bounds a non-streaming request end to end across all
-	// failover attempts. Streams are bounded by the per-attempt no-progress
-	// deadline instead (D15), since they can legitimately run for minutes.
-	RequestTimeout time.Duration
+	Log            *slog.Logger
+	Gateway        *gateway.Gateway
+	Metrics        *metrics.Metrics
+	Usage          usage.Sink
+	Auth           *auth.Store        // nil = auth disabled
+	Limiter        *ratelimit.Limiter // nil = no rate limits / spend caps
+	MaxBodyBytes   int64
+	RequestTimeout time.Duration // non-streaming only; streams use a per-attempt deadline
 	CacheOn        bool
 }
 
@@ -57,7 +52,6 @@ func NewServer(d Deps) *Server {
 	}
 	s := &Server{log: d.Log, gw: d.Gateway, m: d.Metrics, usage: d.Usage, auth: d.Auth,
 		limiter: d.Limiter, maxBodyBytes: d.MaxBodyBytes, reqTimeout: d.RequestTimeout, cacheOn: d.CacheOn, mux: http.NewServeMux()}
-	// Go 1.22+ ServeMux supports method + path patterns, so no router dependency.
 	s.mux.HandleFunc("GET /healthz", s.handleHealthz)
 	s.mux.HandleFunc("GET /readyz", s.handleReadyz)
 	s.mux.Handle("POST /v1/chat/completions", s.withAuth(http.HandlerFunc(s.handleChat)))
@@ -65,8 +59,7 @@ func NewServer(d Deps) *Server {
 	return s
 }
 
-// Handler returns the public middleware chain. Order matters: request id is
-// outermost so the access log and panic log both see it.
+// Handler returns the public middleware chain; request id is outermost.
 func (s *Server) Handler() http.Handler {
 	var h http.Handler = s.mux
 	h = withRecover(s.log, h)
@@ -75,9 +68,7 @@ func (s *Server) Handler() http.Handler {
 	return h
 }
 
-// AdminHandler serves metrics, deployment health and pprof on a separate port.
-// Never exposed through the public listener: pprof can leak memory contents
-// and /admin shows internal topology.
+// AdminHandler is never exposed on the public listener: pprof can leak memory.
 func (s *Server) AdminHandler() http.Handler {
 	mux := http.NewServeMux()
 	mux.Handle("GET /metrics", promhttp.HandlerFor(s.m.Registry, promhttp.HandlerOpts{}))
@@ -90,14 +81,9 @@ func (s *Server) AdminHandler() http.Handler {
 	return mux
 }
 
-// SetReady flips readiness. main sets it true once dependencies are up and
-// false at the start of shutdown, so the load balancer stops sending new
-// traffic while in-flight requests drain.
 func (s *Server) SetReady(v bool) { s.ready.Store(v) }
 
-// Liveness vs readiness: /healthz answers "is the process alive?" and must not
-// depend on Redis/Kafka, or a Redis blip would make Kubernetes restart every
-// pod at once. /readyz answers "should I get traffic?" and is allowed to fail.
+// must not depend on Redis/Kafka, or a blip there restarts every pod
 func (s *Server) handleHealthz(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "text/plain")
 	_, _ = w.Write([]byte("ok"))
@@ -113,8 +99,6 @@ func (s *Server) handleReadyz(w http.ResponseWriter, _ *http.Request) {
 	_, _ = w.Write([]byte("ready"))
 }
 
-// errorBody mirrors OpenAI's error envelope so existing OpenAI SDKs parse our
-// errors without changes.
 type errorBody struct {
 	Error struct {
 		Message string `json:"message"`

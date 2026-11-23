@@ -27,35 +27,21 @@ type chunk struct {
 	Usage   map[string]int `json:"usage,omitempty"`
 }
 
-// streamChat proxies a stream to the client in OpenAI's SSE format.
-//
-// Lifecycle:
-//  1. gw.ChatStream fails over across providers until one yields a first
-//     chunk. Nothing has been sent yet, so on failure we can still return a
-//     normal JSON error with a proper status code.
-//  2. Headers go out (status 200 is now committed) and every chunk is flushed
-//     immediately. Buffering here would turn time-to-first-token into
-//     time-to-last-token.
-//  3. If the upstream fails mid-stream, we can't change the status or switch
-//     providers (the client already has partial text from one model). We send
-//     an SSE error event and end the stream without [DONE], so clients can tell
-//     a cut stream from a complete one.
-//  4. If the client disconnects, r.Context() is canceled, which aborts the
-//     upstream request too, so we stop paying for tokens nobody will read.
+// gw.ChatStream fails over until a provider yields a first chunk, only then
+// do headers commit; a mid-stream failure can't switch providers, so it's
+// reported as an SSE error event with no trailing [DONE].
 func (s *Server) streamChat(w http.ResponseWriter, r *http.Request, req *llm.ChatRequest, opt gateway.Options, includeUsage bool, start time.Time) {
 	st, err := s.gw.ChatStream(r.Context(), req, opt)
 	if err != nil {
 		status := s.writeUpstreamError(w, r, err)
-		s.finish(r, req, start, status, llm.AsError(err).Kind.String(), nil, 0)
+		s.finish(r, req, start, status, llm.AsError(err).Kind.String(), failureOutcome(err), 0)
 		return
 	}
-	defer st.Close()
+	defer func() { _ = st.Close() }()
 	s.m.ActiveStreams.Inc()
 	defer s.m.ActiveStreams.Dec()
 
-	// Gateway overhead to first token: total time so far minus time spent
-	// waiting for the provider's first chunk.
-	overhead := time.Since(start) - st.TTFT
+	overhead := time.Since(start) - st.TTFT // gateway overhead to first token
 	deployID := st.DeploymentID("cache")
 	h := w.Header()
 	h.Set("Content-Type", "text/event-stream")
@@ -105,8 +91,7 @@ func (s *Server) streamChat(w http.ResponseWriter, r *http.Request, req *llm.Cha
 				_, _ = w.Write(append(append([]byte("data: "), b...), '\n', '\n'))
 				_ = rc.Flush()
 			}
-			// Bill what was produced so far: the provider charges for it.
-			o.usage = llm.Usage{OutputTokens: outChars/4 + 1, Estimated: true}
+			o.usage = llm.Usage{OutputTokens: estimateOutputTokens(outChars), Estimated: true} // bill what was produced
 			s.costOf(o)
 			s.finish(r, req, start, http.StatusOK, "midstream_"+e.Kind.String(), o, ttft)
 			return
@@ -131,9 +116,8 @@ func (s *Server) streamChat(w http.ResponseWriter, r *http.Request, req *llm.Cha
 			fr = &c.FinishReason
 		}
 		if !send(chunk{Choices: []chunkChoice{{Delta: delta, FinishReason: fr}}}) {
-			// Client went away. Returning closes the upstream (defer st.Close),
-			// which stops generation and further billing.
-			o.usage = llm.Usage{OutputTokens: outChars/4 + 1, Estimated: true}
+			// client gone; closing the upstream (defer st.Close) stops billing
+			o.usage = llm.Usage{OutputTokens: estimateOutputTokens(outChars), Estimated: true}
 			s.costOf(o)
 			s.finish(r, req, start, 499, "client_disconnected", o, ttft)
 			return
@@ -141,9 +125,7 @@ func (s *Server) streamChat(w http.ResponseWriter, r *http.Request, req *llm.Cha
 	}
 
 	if usage == nil {
-		// Provider didn't report usage; estimate output (~4 chars/token) and flag
-		// it, so cost reports never present a guess as a billed amount.
-		usage = &llm.Usage{OutputTokens: outChars/4 + 1, Estimated: true}
+		usage = &llm.Usage{OutputTokens: estimateOutputTokens(outChars), Estimated: true}
 	}
 	if includeUsage {
 		send(chunk{Choices: []chunkChoice{}, Usage: map[string]int{
@@ -157,6 +139,11 @@ func (s *Server) streamChat(w http.ResponseWriter, r *http.Request, req *llm.Cha
 	o.usage = *usage
 	s.costOf(o)
 	s.finish(r, req, start, http.StatusOK, "ok", o, ttft)
+}
+
+// ~4 chars/token; router has its own copy used for ranking, not billing
+func estimateOutputTokens(chars int) int {
+	return chars/4 + 1
 }
 
 func (s *Server) costOf(o *outcome) {

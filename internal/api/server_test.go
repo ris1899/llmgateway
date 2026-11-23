@@ -103,8 +103,6 @@ func TestPanicRecoveryAndAccessLog(t *testing.T) {
 	}
 }
 
-// Guards the Unwrap method on statusRecorder: if it is removed, Flush through
-// the middleware chain fails and SSE streaming would silently buffer.
 func TestFlushThroughMiddleware(t *testing.T) {
 	s, _ := newTestServer()
 	flushErr := make(chan error, 1)
@@ -119,7 +117,7 @@ func TestFlushThroughMiddleware(t *testing.T) {
 		t.Fatal(err)
 	}
 	_, _ = io.Copy(io.Discard, resp.Body)
-	resp.Body.Close()
+	_ = resp.Body.Close()
 	if err := <-flushErr; err != nil {
 		t.Errorf("flush through middleware failed: %v", err)
 	}

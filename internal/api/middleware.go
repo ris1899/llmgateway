@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"log/slog"
 	"net/http"
 	"time"
@@ -15,15 +16,12 @@ type ctxKey int
 
 const requestIDKey ctxKey = 0
 
-// RequestID returns the request id stored in ctx, or "" if none.
 func RequestID(ctx context.Context) string {
 	id, _ := ctx.Value(requestIDKey).(string)
 	return id
 }
 
-// withRequestID accepts a caller-supplied id so a trace can span client →
-// gateway → logs, but only if it looks sane: an attacker-controlled 1 MB header
-// would otherwise be copied into every log line.
+// validated so an attacker-controlled huge header isn't copied into every log line
 func withRequestID(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		id := r.Header.Get(HeaderRequestID)
@@ -40,11 +38,15 @@ func validRequestID(id string) bool {
 		return false
 	}
 	for _, c := range id {
-		if !(c == '-' || c == '_' || c >= '0' && c <= '9' || c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z') {
+		if !isIDChar(c) {
 			return false
 		}
 	}
 	return true
+}
+
+func isIDChar(c rune) bool {
+	return c == '-' || c == '_' || c >= '0' && c <= '9' || c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z'
 }
 
 func newRequestID() string {
@@ -53,7 +55,6 @@ func newRequestID() string {
 	return hex.EncodeToString(b[:])
 }
 
-// statusRecorder captures the status code for access logs.
 type statusRecorder struct {
 	http.ResponseWriter
 	status int
@@ -76,13 +77,10 @@ func (r *statusRecorder) Write(b []byte) (int, error) {
 	return n, err
 }
 
-// Unwrap is what keeps SSE working through this wrapper: http.ResponseController
-// follows Unwrap to find the underlying Flusher. Without it, wrapping the
-// writer silently breaks streaming flushes, a classic middleware bug.
+// http.ResponseController follows Unwrap to find the underlying Flusher; without it, SSE flushes silently break
 func (r *statusRecorder) Unwrap() http.ResponseWriter { return r.ResponseWriter }
 
-// withAccessLog emits one structured line per request. Health probes are
-// skipped: at a 1s kubelet interval they'd drown the useful lines.
+// health probes skipped: at a 1s kubelet interval they'd drown the useful lines
 func withAccessLog(log *slog.Logger, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/healthz" || r.URL.Path == "/readyz" {
@@ -103,14 +101,12 @@ func withAccessLog(log *slog.Logger, next http.Handler) http.Handler {
 	})
 }
 
-// withRecover turns a handler panic into a 500 instead of a dropped connection,
-// and logs the request id so the panic can be tied to a specific call.
 func withRecover(log *slog.Logger, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		defer func() {
 			if v := recover(); v != nil {
-				if v == http.ErrAbortHandler { // deliberate abort, let net/http handle it
-					panic(v)
+				if err, ok := v.(error); ok && errors.Is(err, http.ErrAbortHandler) {
+					panic(v) // deliberate abort, let net/http handle it
 				}
 				log.Error("panic", "request_id", RequestID(r.Context()), "panic", v)
 				writeError(w, http.StatusInternalServerError, "server_error", "internal error")

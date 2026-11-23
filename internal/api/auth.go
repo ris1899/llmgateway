@@ -10,14 +10,8 @@ import (
 	"llmgateway/internal/ratelimit"
 )
 
-// withAuth authenticates the API key, then applies its rate limit and spend
-// cap. Order: auth first (cheap, cached), then the Redis round trip.
-//
-// Failure policy when Redis is down: fail OPEN (allow). The trade-off: during
-// a Redis outage, limits aren't enforced, but the gateway keeps serving. The
-// alternative, fail closed, turns a Redis outage into a full outage for every
-// customer. For a gateway whose job is availability, open is the right
-// default; the error counter makes the outage visible.
+// Fails open on a Redis error: limits go unenforced rather than the gateway
+// going fully down; the error counter makes the outage visible.
 func (s *Server) withAuth(next http.Handler) http.Handler {
 	if s.auth == nil {
 		return next
@@ -44,7 +38,7 @@ func (s *Server) withAuth(next http.Handler) http.Handler {
 				RPS: key.RPS, Burst: key.Burst, MonthlyCapUSD: key.MonthlyCapUSD})
 			switch {
 			case err != nil:
-				s.m.RateLimited.WithLabelValues("error").Inc() // fail open, see above
+				s.m.RateLimited.WithLabelValues("error").Inc()
 			case dec == ratelimit.RateLimited:
 				s.m.RateLimited.WithLabelValues("rate").Inc()
 				w.Header().Set("Retry-After", strconv.Itoa(max(1, int(retry.Seconds()+0.999))))
@@ -52,8 +46,7 @@ func (s *Server) withAuth(next http.Handler) http.Handler {
 				return
 			case dec == ratelimit.OverSpendCap:
 				s.m.RateLimited.WithLabelValues("spend").Inc()
-				// 402 would be semantically neat, but OpenAI SDKs treat 429 with
-				// type "insufficient_quota" as the quota signal, so mirror that.
+				// mirrors OpenAI SDKs' quota signal (429 insufficient_quota) rather than 402
 				writeError(w, http.StatusTooManyRequests, "insufficient_quota", "monthly spend cap reached for this API key")
 				return
 			}

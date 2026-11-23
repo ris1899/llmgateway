@@ -18,8 +18,6 @@ import (
 	"llmgateway/internal/usage"
 )
 
-// Response headers make routing visible: in a demo, curl -i shows which
-// provider served the call and what the gateway itself cost in latency.
 const (
 	HeaderProvider = "X-Gateway-Provider"
 	HeaderAttempts = "X-Gateway-Attempts"
@@ -30,16 +28,13 @@ const (
 	HeaderHedged   = "X-Gateway-Hedged"
 	HeaderSticky   = "X-Gateway-Sticky" // new | hit | moved
 
-	// Request headers: per-request routing policy.
 	HeaderStrategy      = "X-Gateway-Strategy"
 	HeaderLatencyTarget = "X-Gateway-Latency-Target-Ms"
 	HeaderNoCache       = "X-Gateway-No-Cache"
-	// HeaderSession is the client's conversation id. Same id = same provider
-	// across turns (unless that provider breaks).
-	HeaderSession = "X-Gateway-Session"
+	HeaderSession       = "X-Gateway-Session" // client's conversation id
 )
 
-// options builds the routing policy: header > API key default > model default.
+// header > API key default > model default
 func options(r *http.Request) (gateway.Options, error) {
 	var o gateway.Options
 	if k := auth.FromContext(r.Context()); k != nil {
@@ -58,14 +53,12 @@ func options(r *http.Request) (gateway.Options, error) {
 		}
 		o.Policy.LatencyTarget = time.Duration(ms) * time.Millisecond
 	}
-	// Cache-Control: no-cache is the standard way to opt out; ours is explicit.
 	o.NoCache = strings.EqualFold(r.Header.Get(HeaderNoCache), "true") ||
 		strings.Contains(r.Header.Get("Cache-Control"), "no-cache")
 	if sid := r.Header.Get(HeaderSession); sid != "" {
 		if len(sid) > 256 {
 			return o, badRequest(HeaderSession + " must be at most 256 characters")
 		}
-		// Scope by API key so one tenant can't steer another's conversation.
 		keyID := "anonymous"
 		if k := auth.FromContext(r.Context()); k != nil {
 			keyID = k.ID
@@ -84,6 +77,11 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		var mbe *http.MaxBytesError
 		if errors.As(err, &mbe) {
 			writeError(w, http.StatusRequestEntityTooLarge, "invalid_request_error", "request body too large")
+			return
+		}
+		var br badRequest
+		if errors.As(err, &br) {
+			writeError(w, http.StatusBadRequest, "invalid_request_error", br.Error())
 			return
 		}
 		writeError(w, http.StatusBadRequest, "invalid_request_error", "invalid JSON: "+err.Error())
@@ -114,15 +112,11 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	res, err := s.gw.Chat(ctx, req, opt)
 	if err != nil {
 		status := s.writeUpstreamError(w, r, err)
-		s.finish(r, req, start, status, llm.AsError(err).Kind.String(), nil, 0)
+		s.finish(r, req, start, status, llm.AsError(err).Kind.String(), failureOutcome(err), 0)
 		return
 	}
 	resp := res.Response
-	// Overhead = everything except waiting on providers: decode, validation,
-	// auth, rate limit, cache lookup, routing. Measured right before encoding,
-	// so it excludes writing the body (small for chat payloads). This is the
-	// number behind the "< 5 ms p99 overhead" target.
-	overhead := time.Since(start) - res.Upstream
+	overhead := time.Since(start) - res.Upstream // everything except waiting on providers
 	cost := 0.0
 	if res.Deployment != nil && !res.CacheHit {
 		cost = res.Deployment.Cost(resp.Usage)
@@ -161,7 +155,6 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	}, 0)
 }
 
-// outcome is what a successful request produced, for metrics/usage/spend.
 type outcome struct {
 	deployID string
 	d        *router.Deployment
@@ -171,8 +164,16 @@ type outcome struct {
 	cacheHit bool
 }
 
-// finish is the single exit point for accounting: metrics, spend, usage event,
-// log line. Keeping it in one place guarantees every request is counted once.
+// nil if the error happened before any attempt was made
+func failureOutcome(err error) *outcome {
+	var f *gateway.Failure
+	if !errors.As(err, &f) {
+		return nil
+	}
+	return &outcome{deployID: f.DeployID, d: f.Deployment, attempts: f.Attempts}
+}
+
+// single exit point for accounting: metrics, spend, usage event, log line
 func (s *Server) finish(r *http.Request, req *llm.ChatRequest, start time.Time, status int, kind string, o *outcome, ttft time.Duration) {
 	dur := time.Since(start)
 	cache := "false"
@@ -182,7 +183,7 @@ func (s *Server) finish(r *http.Request, req *llm.ChatRequest, start time.Time, 
 	s.m.Requests.WithLabelValues(req.Model, strconv.Itoa(status), cache).Inc()
 	lat := dur
 	if req.Stream && ttft > 0 {
-		lat = ttft // for streams the latency that matters to users is TTFT
+		lat = ttft // streams: latency that matters to users is TTFT
 	}
 	if status == http.StatusOK {
 		s.m.RequestLatency.WithLabelValues(req.Model, strconv.FormatBool(req.Stream)).Observe(lat.Seconds())
@@ -230,17 +231,23 @@ func cacheLabel(hit bool, req *llm.ChatRequest, opt gateway.Options, cacheOn boo
 	}
 }
 
-// writeUpstreamError maps an error to the status the *client* should see and
-// returns it. Auth → 502: a provider 401 means our provider key is broken,
-// which is the gateway's problem, not the caller's.
+// Auth kind maps to 502: a provider 401 means our provider key is broken.
 func (s *Server) writeUpstreamError(w http.ResponseWriter, r *http.Request, err error) int {
+	var f *gateway.Failure
+	if errors.As(err, &f) {
+		w.Header().Set(HeaderAttempts, strconv.Itoa(f.Attempts))
+		if f.DeployID != "" {
+			w.Header().Set(HeaderProvider, f.DeployID)
+		}
+		if f.Hedged {
+			w.Header().Set(HeaderHedged, "true")
+		}
+	}
 	switch {
 	case errors.Is(err, gateway.ErrUnknownModel):
 		writeError(w, http.StatusNotFound, "model_not_found", "model not found; see GET /v1/models")
 		return http.StatusNotFound
 	case errors.Is(err, gateway.ErrNoHealthy):
-		// Every deployment's breaker is open: fail fast instead of waiting on
-		// providers we already know are down.
 		w.Header().Set("Retry-After", "1")
 		writeError(w, http.StatusServiceUnavailable, "no_healthy_upstream", "all providers for this model are unavailable")
 		return http.StatusServiceUnavailable
@@ -255,17 +262,18 @@ func (s *Server) writeUpstreamError(w http.ResponseWriter, r *http.Request, err 
 	case llm.KindRateLimited:
 		status, typ = http.StatusTooManyRequests, "rate_limit_error"
 		if e.RetryAfter > 0 {
-			w.Header().Set("Retry-After", strconv.Itoa(int(e.RetryAfter.Seconds()+0.999)))
+			w.Header().Set("Retry-After", strconv.Itoa(max(1, int(e.RetryAfter.Seconds()+0.999)))) // round up, floor at 1s
 		}
 	case llm.KindTimeout:
 		status, typ = http.StatusGatewayTimeout, "timeout"
+	case llm.KindNotFound:
+		typ = "upstream_model_not_found" // gateway config is wrong, not the client's request
 	case llm.KindCanceled:
 		return 499 // client closed request (nginx convention); nobody to answer
 	}
 	s.log.Warn("upstream failed", "request_id", RequestID(r.Context()), "provider", e.Provider,
 		"kind", e.Kind.String(), "status", e.Status, "err", e.Err)
-	// Full details go to the log only: raw upstream errors can contain internal
-	// hostnames, and provider error bodies sometimes echo request content.
+	// log only: raw upstream errors may contain internal hostnames or echoed request content
 	writeError(w, status, typ, fmt.Sprintf("upstream %s failed: %s", e.Provider, e.Kind))
 	return status
 }

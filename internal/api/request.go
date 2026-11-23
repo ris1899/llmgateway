@@ -9,9 +9,9 @@ import (
 	"llmgateway/internal/llm"
 )
 
-// chatRequest is the OpenAI request shape we accept. Fields we don't model are
-// ignored, except the ones in toLLM's rejections, which change the meaning of
-// the request too much to drop silently.
+// chatRequest is the OpenAI request shape we accept. UnmarshalJSON allowlists
+// every top-level field, rejecting unknowns with 400 instead of silently
+// dropping them (e.g. a client expecting seed/logit_bias to take effect).
 type chatRequest struct {
 	Model    string `json:"model"`
 	Messages []struct {
@@ -21,8 +21,8 @@ type chatRequest struct {
 	Temperature         *float64        `json:"temperature"`
 	TopP                *float64        `json:"top_p"`
 	MaxTokens           *int            `json:"max_tokens"`
-	MaxCompletionTokens *int            `json:"max_completion_tokens"` // newer OpenAI name
-	Stop                json.RawMessage `json:"stop"`                  // string or []string
+	MaxCompletionTokens *int            `json:"max_completion_tokens"`
+	Stop                json.RawMessage `json:"stop"` // string, []string, or null
 	Stream              bool            `json:"stream"`
 	StreamOptions       *struct {
 		IncludeUsage bool `json:"include_usage"`
@@ -33,9 +33,42 @@ type chatRequest struct {
 	N         *int            `json:"n"`
 }
 
+// keep in sync with chatRequest's json tags
+var chatRequestFields = map[string]bool{
+	"model":                 true,
+	"messages":              true,
+	"temperature":           true,
+	"top_p":                 true,
+	"max_tokens":            true,
+	"max_completion_tokens": true,
+	"stop":                  true,
+	"stream":                true,
+	"stream_options":        true,
+	"tools":                 true,
+	"functions":             true,
+	"n":                     true,
+	"user":                  true, // harmless metadata; accepted and ignored
+}
+
+func (c *chatRequest) UnmarshalJSON(data []byte) error {
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	for field := range raw {
+		if !chatRequestFields[field] {
+			return badRequest(fmt.Sprintf("unsupported parameter: %s", field))
+		}
+	}
+	type alias chatRequest // avoids recursing into UnmarshalJSON
+	return json.Unmarshal(data, (*alias)(c))
+}
+
 type badRequest string
 
 func (e badRequest) Error() string { return string(e) }
+
+const maxStopSequences = 4 // OpenAI's own limit
 
 func (c *chatRequest) toLLM() (*llm.ChatRequest, error) {
 	if len(c.Tools) > 0 || len(c.Functions) > 0 {
@@ -50,6 +83,19 @@ func (c *chatRequest) toLLM() (*llm.ChatRequest, error) {
 	if len(c.Messages) == 0 {
 		return nil, badRequest("messages must not be empty")
 	}
+	if c.Temperature != nil && (*c.Temperature < 0 || *c.Temperature > 2) {
+		return nil, badRequest("temperature must be between 0 and 2")
+	}
+	if c.TopP != nil && (*c.TopP <= 0 || *c.TopP > 1) {
+		return nil, badRequest("top_p must be between 0 (exclusive) and 1")
+	}
+	if c.MaxTokens != nil && *c.MaxTokens <= 0 {
+		return nil, badRequest("max_tokens must be a positive integer")
+	}
+	if c.MaxCompletionTokens != nil && *c.MaxCompletionTokens <= 0 {
+		return nil, badRequest("max_completion_tokens must be a positive integer")
+	}
+
 	r := &llm.ChatRequest{
 		Model: c.Model, Temperature: c.Temperature, TopP: c.TopP,
 		MaxTokens: c.MaxTokens, Stream: c.Stream,
@@ -71,19 +117,40 @@ func (c *chatRequest) toLLM() (*llm.ChatRequest, error) {
 		}
 		r.Messages = append(r.Messages, llm.Message{Role: m.Role, Content: text})
 	}
-	if len(c.Stop) > 0 {
-		var one string
-		if json.Unmarshal(c.Stop, &one) == nil {
-			r.Stop = []string{one}
-		} else if json.Unmarshal(c.Stop, &r.Stop) != nil {
-			return nil, badRequest("stop must be a string or array of strings")
-		}
+
+	stop, err := parseStop(c.Stop)
+	if err != nil {
+		return nil, err
 	}
+	r.Stop = stop
+
 	return r, nil
 }
 
-// textContent accepts a plain string, or OpenAI's array-of-parts form as long
-// as every part is text. Images etc. are rejected rather than dropped.
+// null must be special-cased first: it unmarshals into a Go string as "",
+// which would otherwise become a single empty stop sequence.
+func parseStop(raw json.RawMessage) ([]string, error) {
+	if len(raw) == 0 || string(raw) == "null" {
+		return nil, nil
+	}
+	var one string
+	var stop []string
+	if json.Unmarshal(raw, &one) == nil {
+		stop = []string{one}
+	} else if json.Unmarshal(raw, &stop) != nil {
+		return nil, badRequest("stop must be a string, array of strings, or null")
+	}
+	if len(stop) > maxStopSequences {
+		return nil, badRequest(fmt.Sprintf("stop supports at most %d sequences", maxStopSequences))
+	}
+	for _, s := range stop {
+		if s == "" {
+			return nil, badRequest("stop sequences must not be empty strings")
+		}
+	}
+	return stop, nil
+}
+
 func textContent(raw json.RawMessage) (string, error) {
 	var s string
 	if json.Unmarshal(raw, &s) == nil {

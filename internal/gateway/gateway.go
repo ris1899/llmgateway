@@ -1,9 +1,4 @@
-// Package gateway is the request pipeline, independent of HTTP:
-//
-//	cache lookup → router plan → attempts (breaker, budget, hedging) → record
-//
-// The router decides the order; this package executes it, feeds outcomes back
-// into health stats, and returns the result plus metadata the API layer needs.
+// Package gateway executes the router's plan: attempts, failover, hedging.
 package gateway
 
 import (
@@ -41,13 +36,10 @@ func (g *Gateway) Models() []string { return g.r.GroupNames() }
 
 func (g *Gateway) Status() []router.DeploymentStatus { return g.r.Status() }
 
-// Options are per-request knobs from headers / API key.
 type Options struct {
 	Policy  router.Policy
 	NoCache bool
-	// Session is the client's conversation id, already scoped by API key.
-	// Empty = no sticky routing for this request.
-	Session string
+	Session string // client's conversation id, scoped by API key; "" = no sticky routing
 }
 
 type Result struct {
@@ -61,7 +53,30 @@ type Result struct {
 	Sticky     string        // "", new, hit, moved (see stickyUpdate)
 }
 
-// --- non-streaming ---
+// Failure wraps an upstream error with the attempt metadata collected before
+// it gave up, so failed-request logs/headers show which deployments were tried.
+type Failure struct {
+	Err        error
+	Attempts   int
+	Deployment *router.Deployment // last (or only) deployment tried
+	DeployID   string
+	Hedged     bool
+	Upstream   time.Duration
+}
+
+func (f *Failure) Error() string { return f.Err.Error() }
+func (f *Failure) Unwrap() error { return f.Err }
+
+func withAttempts(err error, attempts int, d *router.Deployment, hedged bool, upstream time.Duration) error {
+	if attempts == 0 || err == nil {
+		return err
+	}
+	deployID := ""
+	if d != nil {
+		deployID = d.ID
+	}
+	return &Failure{Err: err, Attempts: attempts, Deployment: d, DeployID: deployID, Hedged: hedged, Upstream: upstream}
+}
 
 func (g *Gateway) Chat(ctx context.Context, req *llm.ChatRequest, opt Options) (*Result, error) {
 	grp, ok := g.r.Group(req.Model)
@@ -111,8 +126,7 @@ type attemptResult struct {
 	dur   time.Duration
 }
 
-// chatUpstream walks the plan. At most two attempts are in flight at once
-// (primary + one hedge). The first success wins and cancels the other.
+// at most two attempts in flight at once (primary + one hedge); first success wins
 func (g *Gateway) chatUpstream(ctx context.Context, grp *router.Group, req *llm.ChatRequest, opt Options) (*Result, error) {
 	now := time.Now()
 	g.r.Budget.OnRequest(now)
@@ -132,13 +146,11 @@ func (g *Gateway) chatUpstream(ctx context.Context, grp *router.Group, req *llm.
 	next, inflight, attempts := 0, 0, 0
 	hedged := false
 	var lastErr error
-	prevOpen := false // was the last failed deployment's breaker open after it failed?
+	var lastDeploy *router.Deployment
+	var firstDeploy *router.Deployment // launch() can skip plan[0] on breaker denial
+	prevOpen := false
 
-	// When we return early (a winner, or a non-retryable error), the other
-	// attempt is still running. Drain it in the background so its outcome is
-	// recorded: otherwise a losing half-open probe would hold the probe slot
-	// forever and the breaker could never close again.
-	defer func() {
+	defer func() { // drain the loser so a held half-open probe slot isn't leaked
 		if n := inflight; n > 0 {
 			go func() {
 				for range n {
@@ -148,8 +160,6 @@ func (g *Gateway) chatUpstream(ctx context.Context, grp *router.Group, req *llm.
 		}
 	}()
 
-	// launch starts the next allowed deployment. A deployment whose breaker
-	// flipped open since Plan was built is skipped here.
 	launch := func(isRetry bool) bool {
 		for next < len(plan) {
 			d := plan[next]
@@ -158,10 +168,7 @@ func (g *Gateway) chatUpstream(ctx context.Context, grp *router.Group, req *llm.
 			if !ok {
 				continue
 			}
-			// Retry budget: the first attempt is free. A failover is free when
-			// the failed deployment's breaker is now open (the breaker already
-			// limits load there). Everything else spends budget.
-			if isRetry && !prevOpen {
+			if isRetry && !prevOpen { // failover onto an open breaker is free
 				if !g.r.Budget.TryRetry(time.Now()) {
 					g.m.RetryBudget.WithLabelValues("exhausted").Inc()
 					if probe { // give the probe slot back
@@ -174,6 +181,9 @@ func (g *Gateway) chatUpstream(ctx context.Context, grp *router.Group, req *llm.
 			}
 			attempts++
 			inflight++
+			if !isRetry {
+				firstDeploy = d
+			}
 			go func() {
 				d.Stats.IncInFlight()
 				t0 := time.Now()
@@ -187,7 +197,7 @@ func (g *Gateway) chatUpstream(ctx context.Context, grp *router.Group, req *llm.
 	}
 
 	if !launch(false) {
-		return nil, ErrNoHealthy
+		return nil, ErrNoHealthy // no deployment's breaker admitted a request: nothing was attempted
 	}
 
 	var hedgeC <-chan time.Time
@@ -201,8 +211,7 @@ func (g *Gateway) chatUpstream(ctx context.Context, grp *router.Group, req *llm.
 		select {
 		case <-hedgeC:
 			hedgeC = nil
-			// A hedge is a retry for budgeting purposes: it adds load.
-			prevOpen = false
+			prevOpen = false // hedge is budgeted like a retry
 			if launch(true) {
 				hedged = true
 				g.m.Hedges.WithLabelValues("started").Inc()
@@ -211,7 +220,7 @@ func (g *Gateway) chatUpstream(ctx context.Context, grp *router.Group, req *llm.
 			inflight--
 			g.recordAttempt(ar, ctx)
 			if ar.err == nil {
-				if hedged && ar.d != plan[0] {
+				if hedged && ar.d != firstDeploy {
 					g.m.Hedges.WithLabelValues("won").Inc()
 				}
 				grp.ObserveOutput(ar.resp.Usage.OutputTokens)
@@ -221,24 +230,23 @@ func (g *Gateway) chatUpstream(ctx context.Context, grp *router.Group, req *llm.
 					Attempts: attempts, Hedged: hedged, Upstream: upstream, Sticky: sticky}, nil
 			}
 			lastErr = ar.err
+			lastDeploy = ar.d
 			e := llm.AsError(ar.err)
 			if !e.Retryable() || ctx.Err() != nil {
 				if inflight == 0 {
-					return nil, ar.err
+					return nil, withAttempts(ar.err, attempts, ar.d, hedged, time.Since(start))
 				}
 				continue
 			}
 			prevOpen = ar.d.Breaker.State() == router.Open
 			if inflight == 0 && !launch(true) {
-				return nil, lastErr
+				return nil, withAttempts(lastErr, attempts, lastDeploy, hedged, time.Since(start))
 			}
 		}
 	}
-	return nil, lastErr
+	return nil, withAttempts(lastErr, attempts, lastDeploy, hedged, time.Since(start))
 }
 
-// recordAttempt feeds health tracking. A hedge loser canceled by us must not
-// count as a failure: it was healthy, we just stopped waiting for it.
 func (g *Gateway) recordAttempt(ar attemptResult, ctx context.Context) {
 	err := ar.err
 	if err != nil && ctx.Err() != nil && llm.AsError(err).Kind != llm.KindTimeout {
@@ -254,17 +262,8 @@ func (g *Gateway) recordAttempt(ar attemptResult, ctx context.Context) {
 	g.m.Attempts.WithLabelValues(ar.d.ID, llm.AsError(err).Kind.String()).Inc()
 }
 
-// --- streaming ---
-
-// Stream is a streaming call that has already received its first chunk.
-//
-// Failover is only possible before anything reaches the client. So we wait for
-// the upstream's first real chunk *before* the API layer sends headers: if the
-// provider fails on connect or before its first token, we can still silently
-// try the next one. After that, failures are reported in-stream (D17).
-//
-// No hedging for streams: two parallel streams would double token cost for
-// the whole answer, and TTFT tail is better handled by the breaker + fastest.
+// Stream has already received its first chunk: failover only works before
+// anything reaches the client, so we wait for it before sending headers.
 type Stream struct {
 	Deployment *router.Deployment
 	Attempts   int
@@ -307,7 +306,7 @@ func (st *Stream) Recv() (llm.StreamChunk, error) {
 		return llm.StreamChunk{}, io.EOF
 	}
 	c, err := st.s.Recv()
-	if err == io.EOF {
+	if errors.Is(err, io.EOF) {
 		st.finish(nil)
 		return c, err
 	}
@@ -321,7 +320,7 @@ func (st *Stream) Recv() (llm.StreamChunk, error) {
 
 func (st *Stream) track(c llm.StreamChunk) {
 	if c.Delta != "" {
-		st.outToks++ // ~1 chunk per token for most providers; only used for TPOT
+		st.outToks++ // ~1 chunk per token
 		st.lastAt = time.Now()
 	}
 	if c.Usage != nil {
@@ -329,8 +328,6 @@ func (st *Stream) track(c llm.StreamChunk) {
 	}
 }
 
-// finish records the stream outcome once. A mid-stream failure counts against
-// the provider (it broke a stream); a clean end updates TPOT.
 func (st *Stream) finish(err error) {
 	if st.finished || st.replay != nil {
 		return
@@ -352,8 +349,6 @@ func (st *Stream) finish(err error) {
 	st.grp.ObserveOutput(toks)
 }
 
-// Close ends the stream. If the client left before the end, that's recorded
-// as neutral: it says nothing about the provider.
 func (st *Stream) Close() error {
 	if st.replay != nil {
 		return nil
@@ -366,8 +361,6 @@ func (st *Stream) Close() error {
 	return st.s.Close()
 }
 
-// ChatStream opens a stream, failing over until a deployment yields a first
-// chunk. Cache hits (if the request is cacheable) are replayed as a stream.
 func (g *Gateway) ChatStream(ctx context.Context, req *llm.ChatRequest, opt Options) (*Stream, error) {
 	grp, ok := g.r.Group(req.Model)
 	if !ok {
@@ -379,8 +372,6 @@ func (g *Gateway) ChatStream(ctx context.Context, req *llm.ChatRequest, opt Opti
 				g.m.Cache.WithLabelValues("hit").Inc()
 				return replayStream(g, grp, e), nil
 			}
-			// Streams are not written to the cache (we'd have to buffer the whole
-			// answer); a later non-streaming call with the same input fills it.
 			g.m.Cache.WithLabelValues("miss").Inc()
 		}
 	}
@@ -391,7 +382,8 @@ func (g *Gateway) ChatStream(ctx context.Context, req *llm.ChatRequest, opt Opti
 	skey, prefer := g.stickyLookup(ctx, grp.Name, opt)
 	pol.Prefer = prefer
 	plan := g.r.Plan(grp, pol, req)
-	var lastErr error = ErrNoHealthy
+	lastErr := ErrNoHealthy
+	var lastDeploy *router.Deployment
 	attempts := 0
 	prevOpen := false
 	for _, d := range plan {
@@ -415,7 +407,7 @@ func (g *Gateway) ChatStream(ctx context.Context, req *llm.ChatRequest, opt Opti
 		s, err := d.Provider.ChatStream(ctx, d.Model, req)
 		if err == nil {
 			first, rerr := s.Recv()
-			if rerr == nil || rerr == io.EOF {
+			if rerr == nil || errors.Is(rerr, io.EOF) {
 				ttft := time.Since(start)
 				d.Stats.ObserveTTFT(ttft)
 				g.m.UpstreamTTFT.WithLabelValues(d.ID).Observe(ttft.Seconds())
@@ -427,28 +419,25 @@ func (g *Gateway) ChatStream(ctx context.Context, req *llm.ChatRequest, opt Opti
 				} else {
 					st.firstEOF = true
 				}
-				// Committed to this deployment (first token received), so this is
-				// the one the conversation sticks to.
 				st.Sticky = g.stickyUpdate(ctx, skey, prefer, d.ID)
 				return st, nil
 			}
-			s.Close()
+			_ = s.Close() // already failing over; the stream itself is discarded
 			err = rerr
 		}
 		d.Stats.DecInFlight()
 		g.r.Record(d, probe, err)
 		g.m.Attempts.WithLabelValues(d.ID, llm.AsError(err).Kind.String()).Inc()
 		lastErr = err
+		lastDeploy = d
 		if !llm.AsError(err).Retryable() || ctx.Err() != nil {
 			break
 		}
 		prevOpen = d.Breaker.State() == router.Open
 	}
-	return nil, lastErr
+	return nil, withAttempts(lastErr, attempts, lastDeploy, false, 0)
 }
 
-// replayStream turns a cached answer into a stream of word-sized chunks, so
-// streaming clients get the same shape they'd get from a provider.
 func replayStream(g *Gateway, grp *router.Group, e *cache.Entry) *Stream {
 	r := e.Response
 	var chunks []llm.StreamChunk
@@ -472,7 +461,6 @@ func replayStream(g *Gateway, grp *router.Group, e *cache.Entry) *Stream {
 	return &Stream{Deployment: d, CacheHit: true, g: g, grp: grp, replay: chunks}
 }
 
-// DeploymentID is safe for cache hits whose deployment may be gone.
 func (st *Stream) DeploymentID(fallback string) string {
 	if st.Deployment != nil {
 		return st.Deployment.ID
