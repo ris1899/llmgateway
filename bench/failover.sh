@@ -1,8 +1,6 @@
 #!/usr/bin/env bash
-# Failover benchmark: drive load at model "mock-chat" (mock-a priority 0,
-# mock-b priority 1) and take mock-a down mid-run, then bring it back.
-# Measures how fast the gateway's breaker routes around the failure and how
-# fast it notices mock-a is healthy again.
+# Failover benchmark: drive load at model "mock-chat", take mock-a down
+# mid-run, bring it back. Measures breaker reaction and recovery time.
 #
 #   ./bench/failover.sh                 # MODE=kill, RPS=500, 60s run
 #   MODE=error ./bench/failover.sh
@@ -59,7 +57,7 @@ sleep 1
   echo "fault_at: ${FAULT_AT}s restore_at: ${RESTORE_AT}s"
 } > "$OUT/env.txt"
 
-# Snapshot :8081/admin/deployments every 500ms with a timestamp, for the whole run.
+# snapshot :8081/admin/deployments every 500ms with a timestamp
 (
   END=$(( $(date +%s) + DURATION + 3 ))
   while [ "$(date +%s)" -lt "$END" ]; do
@@ -71,7 +69,7 @@ sleep 1
 ) &
 PIDS+=("$!")
 
-# Fault injection / restore, timed against the loadgen run in the background below.
+# fault injection / restore, timed against the loadgen run below
 (
   sleep "$FAULT_AT"
   echo "[$(date +%s)] injecting fault mode=$MODE" >> "$OUT/events.log"
@@ -104,24 +102,19 @@ PIDS+=("$!")
 PIDS+=("$!")
 
 echo ">>> running loadgen at ${RPS} rps for ${DURATION}s against mock-chat"
-./bin/loadgen -mode rate -url http://localhost:8080/v1 -model mock-chat \
+./bin/loadgen -url http://localhost:8080/v1 -model mock-chat \
   -rps "$RPS" -duration "${DURATION}s" \
   -timeline "$OUT/timeline.csv" -csv "$OUT/requests.csv" | tee "$OUT/loadgen.txt"
 
 sleep 2 # let the background snapshot/event jobs finish their last tick
 
-# --- post-processing ---
-# total errors and errors during the fault window, straight from the timeline.
+# total errors and errors during the fault window, from the timeline
 TOTAL_ERRORS=$(awk -F, 'NR>1{s+=$4} END{print s+0}' "$OUT/timeline.csv")
 FAULT_WINDOW_ERRORS=$(awk -F, -v a="$FAULT_AT" -v b="$RESTORE_AT" 'NR>1 && $1>=a && $1<b {s+=$4} END{print s+0}' "$OUT/timeline.csv")
 
-# Recovery time: seconds from fault injection until the first full second with
-# zero errors AND p99 below SLOW_MS. Timeline buckets are by request *start*
-# second, so requests that hung on mock-a and then failed over show up as a
-# high p99 in the second they started, not as errors. Checking only errors
-# would report 0s recovery for a hang, which is wrong. SLOW_MS defaults to
-# half the provider timeout (2s in config.example.yaml): any second whose p99
-# is below that had no meaningful share of requests waiting on a timeout.
+# recovery time: first second with 0 errors and p99 < SLOW_MS; checking only
+# errors would miss a hang, since a hung-then-failed-over request shows up as
+# latency in its start second, not as an error
 SLOW_MS=${SLOW_MS:-1000}
 RECOVERY_SEC=$(awk -F, -v a="$FAULT_AT" -v b="$RESTORE_AT" -v slow="$SLOW_MS" '
   NR>1 && $1>=a && $1<b {
@@ -129,11 +122,11 @@ RECOVERY_SEC=$(awk -F, -v a="$FAULT_AT" -v b="$RESTORE_AT" -v slow="$SLOW_MS" '
   }
   END { if (!found) print "not-reached" }
 ' "$OUT/timeline.csv")
-# How many seconds of the fault window had a degraded p99 (>= SLOW_MS).
+# seconds of the fault window with a degraded p99 (>= SLOW_MS)
 DEGRADED_SEC=$(awk -F, -v a="$FAULT_AT" -v b="$RESTORE_AT" -v slow="$SLOW_MS" \
   'NR>1 && $1>=a && $1<b && $6+0 >= slow {n++} END{print n+0}' "$OUT/timeline.csv")
 
-# Traffic-resumed time: seconds after restore until mock-a receives traffic again.
+# seconds after restore until mock-a receives traffic again
 RESUME_SEC=$(awk -F, -v b="$RESTORE_AT" '
   NR>1 && $1>=b {
     if ($7 ~ /mock-a/ && !found) { print $1 - b; found=1 }

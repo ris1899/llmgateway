@@ -1,11 +1,7 @@
 #!/usr/bin/env bash
 # Live smoke test against REAL providers (Groq + Gemini, free tier).
-#
-# Needs: .env.local (LLMGW_GROQ_KEY, LLMGW_GEMINI_KEY) and config.local.yaml.
-# Run:   ./bench/live-test.sh
-# Output is also saved to bench/results/live-<timestamp>.txt (no keys in it).
-#
-# About 20 requests, spaced out to stay under free-tier rate limits (~1.5 min).
+# Needs .env.local (LLMGW_GROQ_KEY, LLMGW_GEMINI_KEY) and config.local.yaml.
+# ~20 requests, spaced to stay under free-tier rate limits (~1.5 min).
 set -u
 cd "$(dirname "$0")/.."
 
@@ -26,8 +22,7 @@ blocked=0
 for u in https://api.groq.com/openai/v1/models https://generativelanguage.googleapis.com/v1beta/openai/models; do
   code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 "$u")
   echo "  $code  $u"
-  # 401/403/404 = reached the provider (it just wants a key). 307 = a proxy is
-  # intercepting HTTPS: stop before any key is sent through it.
+  # 401/403/404 = reached the provider; 307 = a proxy is intercepting HTTPS
   [ "$code" = "307" ] || [ "$code" = "000" ] && blocked=1
 done
 if [ "$blocked" = 1 ]; then
@@ -86,9 +81,7 @@ head -3 /tmp/live-stream.txt | cut -c1-140 | sed 's/^/    /'
 echo
 echo "== 5. Real failover: primary (Gemini) has a 1ms timeout, Groq must answer"
 echo "   expect: first 5 attempts=2 (timeout, then failover); then attempts=1 (breaker open, primary skipped)"
-# No sleep on purpose: requests must land inside the breaker's 2s cooldown.
-# Spaced >2s apart, every request after the 5th becomes a half-open probe
-# (attempts=2 again), which is correct breaker behaviour but hides the open state.
+# no sleep: requests must land inside the breaker's 2s cooldown window
 for i in 1 2 3 4 5 6 7; do ask live-failover; done
 
 echo

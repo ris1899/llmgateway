@@ -1,13 +1,5 @@
-// Command loadgen is a small load generator for the gateway's benchmark
-// scripts. It exists instead of reusing k6 for two cases k6 doesn't cover
-// well on this project: very high concurrent streaming connection counts, and
-// reading gateway-specific response headers (X-Gateway-*) into structured
-// per-request records for later analysis (CSV, timelines).
-//
-// Two modes:
-//
-//	rate:    open-model constant arrival rate load test (see runRate).
-//	streams: sustained concurrent streaming connections (see runStreams).
+// Command loadgen sends requests at a fixed arrival rate and records each
+// one's X-Gateway-* headers, for bench/failover.sh.
 package main
 
 import (
@@ -29,7 +21,6 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
-	"syscall"
 	"time"
 )
 
@@ -60,18 +51,13 @@ type result struct {
 }
 
 func main() {
-	mode := flag.String("mode", "rate", "rate|streams")
-
-	// shared
 	url := flag.String("url", "http://localhost:8080/v1", "base URL (no trailing /chat/completions)")
 	model := flag.String("model", "mock-chat", "model name sent in the request body")
-	stream := flag.Bool("stream", false, "use stream:true (rate mode) / always true in streams mode")
+	stream := flag.Bool("stream", false, "send stream:true")
 	csvPath := flag.String("csv", "", "optional path to write per-request CSV rows")
-	timelinePath := flag.String("timeline", "", "optional path to write per-second timeline CSV (rate mode only)")
-
-	// rate mode
-	rps := flag.Float64("rps", 100, "requests per second (rate mode)")
-	duration := flag.Duration("duration", 10*time.Second, "test duration (rate mode)")
+	timelinePath := flag.String("timeline", "", "optional path to write per-second timeline CSV")
+	rps := flag.Float64("rps", 100, "requests per second")
+	duration := flag.Duration("duration", 10*time.Second, "test duration")
 	var tempSet bool
 	var temperature float64
 	flag.Func("temperature", "temperature to send in body (omitted if not set)", func(s string) error {
@@ -82,11 +68,6 @@ func main() {
 		temperature, tempSet = v, true
 		return nil
 	})
-
-	// streams mode
-	conns := flag.Int("conns", 1000, "number of concurrent streaming connections")
-	ramp := flag.Duration("ramp", 10*time.Second, "time to ramp up to -conns (streams mode)")
-	hold := flag.Duration("hold", 30*time.Second, "time to hold at -conns after ramp (streams mode)")
 
 	headers := make(headerFlags)
 	flag.Var(headers, "header", "extra request header k:v, repeatable")
@@ -102,26 +83,13 @@ func main() {
 	}
 	client := &http.Client{Transport: transport}
 
-	switch *mode {
-	case "rate":
-		runRate(client, rateOpts{
-			url: *url, model: *model, stream: *stream,
-			rps: *rps, duration: *duration,
-			tempSet: tempSet, temperature: temperature,
-			headers: headers, csvPath: *csvPath, timelinePath: *timelinePath,
-		})
-	case "streams":
-		runStreams(client, streamsOpts{
-			url: *url, model: *model, conns: *conns, ramp: *ramp, hold: *hold,
-			tempSet: tempSet, temperature: temperature,
-			headers: headers, csvPath: *csvPath,
-		})
-	default:
-		log.Fatalf("unknown -mode %q", *mode)
-	}
+	runRate(client, rateOpts{
+		url: *url, model: *model, stream: *stream,
+		rps: *rps, duration: *duration,
+		tempSet: tempSet, temperature: temperature,
+		headers: headers, csvPath: *csvPath, timelinePath: *timelinePath,
+	})
 }
-
-// ---------------- request building / execution ----------------
 
 func buildBody(model string, stream bool, tempSet bool, temperature float64) []byte {
 	var b bytes.Buffer
@@ -162,7 +130,7 @@ func doRequest(ctx context.Context, client *http.Client, u, model string, stream
 		r.latencyMs = msSince(start)
 		return r
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	r.status = resp.StatusCode
 	r.provider = resp.Header.Get("X-Gateway-Provider")
@@ -196,8 +164,6 @@ func doRequest(ctx context.Context, client *http.Client, u, model string, stream
 }
 
 func msSince(t time.Time) float64 { return float64(time.Since(t)) / float64(time.Millisecond) }
-
-// ---------------- rate mode ----------------
 
 type rateOpts struct {
 	url, model            string
@@ -233,9 +199,8 @@ func runRate(client *http.Client, o rateOpts) {
 		}
 		atomic.AddInt64(&sent, 1)
 		wg.Add(1)
-		// Launch unconditionally per tick: an open model. A slow server must
-		// show up as latency, never as fewer requests sent ("coordinated
-		// omission").
+		// open model: launch unconditionally per tick so a slow server shows up
+		// as latency, not as fewer requests sent (coordinated omission)
 		go func() {
 			defer wg.Done()
 			r := doRequest(ctx, client, o.url, o.model, o.stream, o.tempSet, o.temperature, o.headers)
@@ -258,106 +223,6 @@ func runRate(client *http.Client, o rateOpts) {
 		}
 	}
 }
-
-// ---------------- streams mode ----------------
-
-type streamsOpts struct {
-	url, model  string
-	conns       int
-	ramp, hold  time.Duration
-	tempSet     bool
-	temperature float64
-	headers     headerFlags
-	csvPath     string
-}
-
-func runStreams(client *http.Client, o streamsOpts) {
-	checkFDLimit(o.conns)
-
-	ctx, cancel := context.WithTimeout(context.Background(), o.ramp+o.hold+60*time.Second)
-	defer cancel()
-
-	stopAt := time.Now().Add(o.ramp + o.hold)
-
-	var openNow, peakOpen, completed, errored int64
-	var ttfts []float64
-	var ttftMu sync.Mutex
-
-	var wg sync.WaitGroup
-	fmt.Printf("streams mode: ramping to %d conns over %s, holding %s\n", o.conns, o.ramp, o.hold)
-
-	launchOne := func() {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for time.Now().Before(stopAt) {
-				cur := atomic.AddInt64(&openNow, 1)
-				for {
-					peak := atomic.LoadInt64(&peakOpen)
-					if cur <= peak || atomic.CompareAndSwapInt64(&peakOpen, peak, cur) {
-						break
-					}
-				}
-				r := doRequest(ctx, client, o.url, o.model, true, o.tempSet, o.temperature, o.headers)
-				atomic.AddInt64(&openNow, -1)
-				if r.err != "" || (r.status != 0 && r.status >= 400) {
-					atomic.AddInt64(&errored, 1)
-				} else {
-					atomic.AddInt64(&completed, 1)
-				}
-				if r.ttftMs >= 0 {
-					ttftMu.Lock()
-					ttfts = append(ttfts, r.ttftMs)
-					ttftMu.Unlock()
-				}
-			}
-		}()
-	}
-
-	// Ramp: spread connection starts evenly over the ramp window.
-	if o.conns > 0 && o.ramp > 0 {
-		step := o.ramp / time.Duration(o.conns)
-		for i := 0; i < o.conns; i++ {
-			launchOne()
-			time.Sleep(step)
-		}
-	} else {
-		for i := 0; i < o.conns; i++ {
-			launchOne()
-		}
-	}
-
-	wg.Wait()
-
-	sort.Float64s(ttfts)
-	fmt.Println("\n--- streams summary ---")
-	fmt.Printf("peak concurrent open streams: %d\n", peakOpen)
-	fmt.Printf("completed streams: %d\n", completed)
-	fmt.Printf("errored streams:   %d\n", errored)
-	if len(ttfts) > 0 {
-		fmt.Printf("TTFT p50=%.1fms p99=%.1fms\n", pct(ttfts, 0.50), pct(ttfts, 0.99))
-	}
-}
-
-// checkFDLimit warns and tries to raise the soft fd limit if it looks too
-// low for the requested connection count.
-func checkFDLimit(conns int) {
-	var rlim syscall.Rlimit
-	if err := syscall.Getrlimit(syscall.RLIMIT_NOFILE, &rlim); err != nil {
-		log.Printf("warning: could not read RLIMIT_NOFILE: %v", err)
-		return
-	}
-	want := uint64(2*conns + 1000)
-	if rlim.Cur < want {
-		log.Printf("warning: ulimit -n is %d, want >= %d for %d connections; raising soft limit to hard limit (%d)", rlim.Cur, want, conns, rlim.Max)
-		rlim.Cur = rlim.Max
-		if err := syscall.Setrlimit(syscall.RLIMIT_NOFILE, &rlim); err != nil {
-			log.Printf("warning: could not raise RLIMIT_NOFILE: %v (run `ulimit -n 65536` before invoking loadgen, or on macOS `sudo launchctl limit maxfiles 65536 200000`)", err)
-		}
-	}
-}
-
-// ---------------- summary / output ----------------
 
 func printSummary(results []result, sent int64, targetRPS float64, duration time.Duration, stream bool) {
 	var ok int
@@ -467,7 +332,7 @@ func writeCSV(path string, results []result) error {
 	if err != nil {
 		return err
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	w := csv.NewWriter(f)
 	defer w.Flush()
 	_ = w.Write([]string{"unix_ms_start", "latency_ms", "ttft_ms", "status", "provider", "overhead_ms", "cache", "error"})
@@ -494,7 +359,7 @@ func writeTimeline(path string, results []result) error {
 		if err != nil {
 			return err
 		}
-		defer f.Close()
+		defer func() { _ = f.Close() }()
 		_, err = f.WriteString("second,sent,ok,errors,p50,p99,providers\n")
 		return err
 	}
@@ -543,7 +408,7 @@ func writeTimeline(path string, results []result) error {
 	if err != nil {
 		return err
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	w := csv.NewWriter(f)
 	defer w.Flush()
 	_ = w.Write([]string{"second", "sent", "ok", "errors", "p50", "p99", "providers"})
