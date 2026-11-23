@@ -1,0 +1,11 @@
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    # Fixed uid so the dashboard JSON can reference it without a provisioning
+    # lookup step.
+    uid: prometheus

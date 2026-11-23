@@ -1,0 +1,6 @@
+bin/
+.env
+.env.*
+*.local.yaml
+bench/results/tmp/
+.DS_Store

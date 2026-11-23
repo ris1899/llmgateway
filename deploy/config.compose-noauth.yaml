@@ -1,0 +1,134 @@
+# Same as config.compose.yaml but with auth disabled, for benchmarking without
+# per-request auth overhead. Cache and usage pipeline stay on. Providers are
+# addressed by compose service name instead of localhost.
+server:
+  addr: ":8080"
+  metrics_addr: ":8081"
+
+redis:
+  addr: redis:6379
+
+cache:
+  enabled: true
+  ttl: 1h
+  max_temperature: 0.3
+
+auth:
+  enabled: false
+  database_url_env: DATABASE_URL
+
+usage:
+  brokers: ["redpanda:9092"]
+
+router:
+  breaker:
+    consecutive_failures: 5
+    error_rate: 0.5
+    min_requests: 20
+    cooldown: 2s
+    half_open_successes: 3
+  retry_budget:
+    ratio: 0.2
+    min_per_sec: 10
+  stats_window: 10s
+
+providers:
+  mock-a:
+    type: openai
+    base_url: http://mock-a:9001/v1
+    timeout: 2s
+  mock-b:
+    type: openai
+    base_url: http://mock-b:9002/v1
+    timeout: 2s
+  mock-anthropic:
+    type: anthropic
+    base_url: http://mock-anthropic:9003/v1
+    timeout: 2s
+
+models:
+  mock-chat:
+    strategy: priority
+    deployments:
+      - provider: mock-a
+        model: mock-small
+        input_price_per_m: 0.15
+        output_price_per_m: 0.60
+        priority: 0
+      - provider: mock-b
+        model: mock-small
+        input_price_per_m: 0.10
+        output_price_per_m: 0.40
+        priority: 1
+
+  mock-fast:
+    strategy: fastest
+    deployments:
+      - provider: mock-a
+        model: mock-small
+        input_price_per_m: 0.15
+        output_price_per_m: 0.60
+        priority: 0
+      - provider: mock-b
+        model: mock-small
+        input_price_per_m: 0.10
+        output_price_per_m: 0.40
+        priority: 1
+
+  mock-cheap:
+    strategy: cheapest
+    latency_target_ms: 500
+    deployments:
+      - provider: mock-a
+        model: mock-small
+        input_price_per_m: 0.15
+        output_price_per_m: 0.60
+        priority: 0
+      - provider: mock-b
+        model: mock-small
+        input_price_per_m: 0.10
+        output_price_per_m: 0.40
+        priority: 1
+
+  mock-split:
+    strategy: weighted
+    deployments:
+      - provider: mock-a
+        model: mock-small
+        input_price_per_m: 0.15
+        output_price_per_m: 0.60
+        weight: 9
+      - provider: mock-b
+        model: mock-small
+        input_price_per_m: 0.10
+        output_price_per_m: 0.40
+        weight: 1
+
+  mock-hedged:
+    strategy: priority
+    hedge_after: 150ms
+    deployments:
+      - provider: mock-a
+        model: mock-small
+        input_price_per_m: 0.15
+        output_price_per_m: 0.60
+        priority: 0
+      - provider: mock-b
+        model: mock-small
+        input_price_per_m: 0.10
+        output_price_per_m: 0.40
+        priority: 1
+
+  mock-openai-style:
+    deployments:
+      - provider: mock-a
+        model: mock-small
+        input_price_per_m: 0.15
+        output_price_per_m: 0.60
+
+  mock-claude-style:
+    deployments:
+      - provider: mock-anthropic
+        model: mock-claude
+        input_price_per_m: 0.80
+        output_price_per_m: 4.00

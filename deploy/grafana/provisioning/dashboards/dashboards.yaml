@@ -1,0 +1,11 @@
+apiVersion: 1
+
+providers:
+  - name: llmgateway
+    folder: ""
+    type: file
+    # Re-read the dashboard file every 10s so edits during development show
+    # up without restarting Grafana.
+    updateIntervalSeconds: 10
+    options:
+      path: /var/lib/grafana/dashboards

@@ -1,0 +1,7 @@
+failover benchmark — MODE=hang RPS=500 duration=60s
+measured on this machine only; not representative of production hardware or network.
+
+total errors over run:            0
+errors during fault window [20s,40s): 0
+recovery time after fault (s, until 0 reqs to mock-a and 0 errors): 0
+time after restore until mock-a receives traffic again (s):        3

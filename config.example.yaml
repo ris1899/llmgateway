@@ -1,0 +1,84 @@
+# Minimal local config: mock providers only, no Redis/Kafka/Postgres, so it
+# runs with zero API keys and zero dependencies. Infrastructure features are
+# off because their sections are absent (see config.bench.yaml and
+# deploy/config.compose.yaml for the full setup).
+
+server:
+  addr: ":8080"
+  metrics_addr: ":8081"   # /metrics, /admin/deployments, /debug/pprof
+
+router:
+  breaker:
+    consecutive_failures: 5
+    error_rate: 0.5
+    min_requests: 20
+    cooldown: 2s
+    half_open_successes: 3
+  retry_budget:
+    ratio: 0.2
+    min_per_sec: 10
+  stats_window: 10s
+
+providers:
+  # Start the mocks with: make mocks
+  mock-a:
+    type: openai
+    base_url: http://localhost:9001/v1
+    timeout: 2s
+  mock-b:
+    type: openai
+    base_url: http://localhost:9002/v1
+    timeout: 2s
+  mock-anthropic:
+    type: anthropic
+    base_url: http://localhost:9003/v1
+    timeout: 2s
+
+models:
+  # Model group with priority strategy: mock-a first, fail over to mock-b.
+  mock-chat:
+    strategy: priority
+    deployments:
+      - provider: mock-a
+        model: mock-small
+        input_price_per_m: 0.15
+        output_price_per_m: 0.60
+        priority: 0
+      - provider: mock-b
+        model: mock-small
+        input_price_per_m: 0.10
+        output_price_per_m: 0.40
+        priority: 1
+
+  # Same deployments, different default strategies. Any of them can also be
+  # chosen per request with the X-Gateway-Strategy header.
+  mock-fast:
+    strategy: fastest
+    deployments:
+      - { provider: mock-a, model: mock-small, input_price_per_m: 0.15, output_price_per_m: 0.60 }
+      - { provider: mock-b, model: mock-small, input_price_per_m: 0.10, output_price_per_m: 0.40 }
+  mock-cheap:
+    strategy: cheapest
+    latency_target_ms: 500
+    deployments:
+      - { provider: mock-a, model: mock-small, input_price_per_m: 0.15, output_price_per_m: 0.60 }
+      - { provider: mock-b, model: mock-small, input_price_per_m: 0.10, output_price_per_m: 0.40 }
+  mock-split:
+    strategy: weighted
+    deployments:
+      - { provider: mock-a, model: mock-small, input_price_per_m: 0.15, output_price_per_m: 0.60, weight: 9 }
+      - { provider: mock-b, model: mock-small, input_price_per_m: 0.10, output_price_per_m: 0.40, weight: 1 }
+  mock-hedged:
+    strategy: priority
+    hedge_after: 150ms
+    deployments:
+      - { provider: mock-a, model: mock-small, input_price_per_m: 0.15, output_price_per_m: 0.60, priority: 0 }
+      - { provider: mock-b, model: mock-small, input_price_per_m: 0.10, output_price_per_m: 0.40, priority: 1 }
+
+  # Single-deployment models, to show one API reaching different providers.
+  mock-openai-style:
+    deployments:
+      - { provider: mock-a, model: mock-small, input_price_per_m: 0.15, output_price_per_m: 0.60 }
+  mock-claude-style:
+    deployments:
+      - { provider: mock-anthropic, model: mock-claude, input_price_per_m: 0.80, output_price_per_m: 4.00 }

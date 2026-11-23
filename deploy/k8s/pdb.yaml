@@ -1,0 +1,12 @@
+# Without a PDB, a node drain or cluster upgrade can evict both replicas at
+# once and drop the gateway to zero. minAvailable: 1 forces evictions to
+# happen one pod at a time.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: gateway
+  namespace: llmgateway
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels: { app: gateway }

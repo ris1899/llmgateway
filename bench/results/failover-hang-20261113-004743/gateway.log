@@ -1,0 +1,13 @@
+{"time":"2026-11-13T00:48:07.705602+05:30","level":"WARN","msg":"circuit breaker","group":"mock-chat","deployment":"mock-a/mock-small","from":"closed","to":"open"}
+{"time":"2026-11-13T00:48:09.7074+05:30","level":"WARN","msg":"circuit breaker","group":"mock-chat","deployment":"mock-a/mock-small","from":"open","to":"half_open"}
+{"time":"2026-11-13T00:48:11.707555+05:30","level":"WARN","msg":"circuit breaker","group":"mock-chat","deployment":"mock-a/mock-small","from":"half_open","to":"open"}
+{"time":"2026-11-13T00:48:13.70952+05:30","level":"WARN","msg":"circuit breaker","group":"mock-chat","deployment":"mock-a/mock-small","from":"open","to":"half_open"}
+{"time":"2026-11-13T00:48:15.709683+05:30","level":"WARN","msg":"circuit breaker","group":"mock-chat","deployment":"mock-a/mock-small","from":"half_open","to":"open"}
+{"time":"2026-11-13T00:48:17.712302+05:30","level":"WARN","msg":"circuit breaker","group":"mock-chat","deployment":"mock-a/mock-small","from":"open","to":"half_open"}
+{"time":"2026-11-13T00:48:19.712712+05:30","level":"WARN","msg":"circuit breaker","group":"mock-chat","deployment":"mock-a/mock-small","from":"half_open","to":"open"}
+{"time":"2026-11-13T00:48:21.713423+05:30","level":"WARN","msg":"circuit breaker","group":"mock-chat","deployment":"mock-a/mock-small","from":"open","to":"half_open"}
+{"time":"2026-11-13T00:48:23.713552+05:30","level":"WARN","msg":"circuit breaker","group":"mock-chat","deployment":"mock-a/mock-small","from":"half_open","to":"open"}
+{"time":"2026-11-13T00:48:25.715485+05:30","level":"WARN","msg":"circuit breaker","group":"mock-chat","deployment":"mock-a/mock-small","from":"open","to":"half_open"}
+{"time":"2026-11-13T00:48:27.715619+05:30","level":"WARN","msg":"circuit breaker","group":"mock-chat","deployment":"mock-a/mock-small","from":"half_open","to":"open"}
+{"time":"2026-11-13T00:48:29.716559+05:30","level":"WARN","msg":"circuit breaker","group":"mock-chat","deployment":"mock-a/mock-small","from":"open","to":"half_open"}
+{"time":"2026-11-13T00:48:29.874972+05:30","level":"WARN","msg":"circuit breaker","group":"mock-chat","deployment":"mock-a/mock-small","from":"half_open","to":"closed"}

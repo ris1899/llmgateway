@@ -1,0 +1,146 @@
+# Full local stack: gateway, three mock providers, Redis (cache/rate-limit),
+# Redpanda (Kafka-compatible usage pipeline), Postgres (auth keys + usage
+# aggregates), the usage consumer, and Prometheus/Grafana for observability.
+#
+#   docker compose -f deploy/compose.yaml up --build
+# Only mock-a builds the mock image; the other mocks reuse it. If all three
+# had a build section, compose would build the same tag three times in
+# parallel and fail with "image already exists".
+x-mock: &mock
+  image: llmgateway-mock
+  pull_policy: never
+
+services:
+  gateway:
+    build:
+      context: ..
+      dockerfile: deploy/docker/Dockerfile
+      args: { CMD: gateway }
+    image: llmgateway
+    command: ["-config", "/etc/llmgateway/config.yaml"]
+    volumes:
+      - ./config.compose.yaml:/etc/llmgateway/config.yaml:ro
+    environment:
+      # auth.enabled reads the Postgres URL from this env var and applies
+      # migrations itself on startup.
+      DATABASE_URL: postgres://llmgw:llmgw@postgres:5432/llmgw?sslmode=disable
+    ports:
+      - "8080:8080" # public API
+      - "8081:8081" # metrics/admin/pprof - kept off the public port on purpose
+    depends_on:
+      mock-a: { condition: service_started }
+      mock-b: { condition: service_started }
+      mock-anthropic: { condition: service_started }
+      redis: { condition: service_healthy }
+      postgres: { condition: service_healthy }
+      redpanda: { condition: service_healthy }
+
+  mock-a:
+    <<: *mock
+    build:
+      context: ..
+      dockerfile: deploy/docker/Dockerfile
+      args: { CMD: mockprovider }
+    command: ["-addr", ":9001", "-name", "mock-a"]
+    ports: ["9001:9001"] # exposed so you can PATCH /admin/behavior from the host
+
+  mock-b:
+    <<: *mock
+    depends_on: [mock-a] # image is built by mock-a
+    command: ["-addr", ":9002", "-name", "mock-b"]
+    ports: ["9002:9002"]
+
+  mock-anthropic:
+    <<: *mock
+    depends_on: [mock-a]
+    command: ["-addr", ":9003", "-name", "mock-anthropic"]
+    ports: ["9003:9003"]
+
+  redis:
+    image: redis:7-alpine
+    ports: ["6379:6379"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: llmgw
+      POSTGRES_PASSWORD: llmgw
+      POSTGRES_DB: llmgw
+    ports: ["5432:5432"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U llmgw -d llmgw"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+  redpanda:
+    # Docker Hub mirror of Redpanda's own registry (docker.redpanda.com),
+    # which some corporate TLS proxies block. Pinned for reproducibility.
+    image: redpandadata/redpanda:v24.2.7
+    # dev-container mode skips the production checks (disk fsync, memory
+    # locking, etc.) that don't make sense in a laptop/CI container.
+    command:
+      - redpanda
+      - start
+      - --mode
+      - dev-container
+      - --smp
+      - "1"
+      - --memory
+      - 512M
+      - --kafka-addr
+      - internal://0.0.0.0:9092,external://0.0.0.0:19092
+      # Advertise a different address per listener: services inside the
+      # compose network use the internal one, the host uses localhost:19092.
+      - --advertise-kafka-addr
+      - internal://redpanda:9092,external://localhost:19092
+    ports:
+      - "19092:19092"
+    healthcheck:
+      test: ["CMD-SHELL", "rpk cluster health | grep -q 'Healthy:.*true'"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  usageconsumer:
+    build:
+      context: ..
+      dockerfile: deploy/docker/Dockerfile
+      args: { CMD: usageconsumer }
+    image: llmgateway-usageconsumer
+    command: ["-brokers", "redpanda:9092"]
+    environment:
+      DATABASE_URL: postgres://llmgw:llmgw@postgres:5432/llmgw?sslmode=disable
+    depends_on:
+      redpanda: { condition: service_healthy }
+      postgres: { condition: service_healthy }
+
+  prometheus:
+    image: prom/prometheus
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports: ["9090:9090"]
+    depends_on: [gateway]
+
+  grafana:
+    image: grafana/grafana
+    environment:
+      # Anonymous admin access: this is a local dev stack, not internet-facing.
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+      GF_AUTH_DISABLE_LOGIN_FORM: "true"
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+    ports: ["3000:3000"]
+    depends_on: [prometheus]
+
+volumes:
+  pgdata:

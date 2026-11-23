@@ -1,0 +1,10 @@
+rate mode: 500.0 rps for 1m0s against http://localhost:8080/v1 model=mock-chat stream=false
+
+--- rate summary ---
+sent: 29996  ok: 29996  errors: 0
+achieved rps: 499.9 (target 500.0)
+latency ms: p50=50.8 p90=51.1 p99=55.5 p999=63.9 max=114.2
+overhead ms: p50=0.0 p99=0.1 max=0.6
+provider distribution: mock-a/mock-small=18883, mock-b/mock-small=11113
+cache distribution: skip=29996
+goroutines at exit (sanity): 113

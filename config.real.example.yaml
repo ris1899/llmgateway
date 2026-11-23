@@ -1,0 +1,43 @@
+# Real providers. Copy to config.local.yaml (gitignored), keep only the
+# providers you have keys for, export the env vars, then:
+#   go run ./cmd/gateway -config config.local.yaml
+#
+# PRICES BELOW ARE PLACEHOLDERS (0). Copy current prices from each provider's
+# pricing page and note the date; they change.
+
+providers:
+  openai:
+    type: openai
+    base_url: https://api.openai.com/v1
+    api_key_env: OPENAI_API_KEY
+    timeout: 60s
+  anthropic:
+    type: anthropic
+    base_url: https://api.anthropic.com/v1
+    api_key_env: LLMGW_ANTHROPIC_API_KEY # gateway-specific: other tools may also read ANTHROPIC_API_KEY
+    timeout: 60s
+  openrouter: # OpenAI-compatible: same adapter, different base_url
+    type: openai
+    base_url: https://openrouter.ai/api/v1
+    api_key_env: OPENROUTER_API_KEY
+    timeout: 60s
+
+models:
+  # Interchangeable small models. Use exact model ids from each provider's docs.
+  fast-chat:
+    deployments:
+      - provider: openai
+        model: REPLACE_WITH_OPENAI_MODEL_ID
+        input_price_per_m: 0
+        output_price_per_m: 0
+        priority: 0
+      - provider: anthropic
+        model: REPLACE_WITH_ANTHROPIC_MODEL_ID
+        input_price_per_m: 0
+        output_price_per_m: 0
+        priority: 1
+      - provider: openrouter
+        model: REPLACE_WITH_OPENROUTER_MODEL_ID
+        input_price_per_m: 0
+        output_price_per_m: 0
+        priority: 2

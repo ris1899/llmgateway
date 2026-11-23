@@ -1,0 +1,59 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gateway
+  namespace: llmgateway
+spec:
+  replicas: 2 # survives one pod being evicted/restarted without 502s
+  selector:
+    matchLabels: { app: gateway }
+  template:
+    metadata:
+      labels: { app: gateway }
+      annotations:
+        # Scrape the metrics/admin port (8081), never the public one (8080).
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8081"
+        prometheus.io/path: /metrics
+    spec:
+      # Give in-flight requests + hedges + the drain delay below room to
+      # finish before the kubelet SIGKILLs the process.
+      terminationGracePeriodSeconds: 45
+      securityContext:
+        runAsNonRoot: true
+      containers:
+        - name: gateway
+          image: llmgateway:latest
+          imagePullPolicy: IfNotPresent
+          args: ["-config", "/etc/llmgateway/config.yaml"]
+          ports:
+            - { name: http, containerPort: 8080 }
+            - { name: metrics, containerPort: 8081 }
+          env:
+            # Delay before the gateway starts shutting down on SIGTERM, so the
+            # endpoint has time to leave kube-proxy/Service routing before new
+            # connections stop being accepted - avoids a race where traffic
+            # keeps arriving after the pod decides it's draining.
+            - { name: GATEWAY_DRAIN_DELAY, value: "5s" }
+          volumeMounts:
+            - { name: config, mountPath: /etc/llmgateway, readOnly: true }
+          securityContext:
+            readOnlyRootFilesystem: true
+          resources:
+            requests: { cpu: 500m, memory: 128Mi }
+            limits: { cpu: "2", memory: 512Mi }
+          readinessProbe:
+            # readyz reflects dependency health (redis etc) - take the pod out
+            # of the Service without restarting it when a dependency blips.
+            httpGet: { path: /readyz, port: 8080 }
+            periodSeconds: 5
+            failureThreshold: 3
+          livenessProbe:
+            # healthz only checks the process is alive - a dependency outage
+            # must not cause a restart loop that can't fix the dependency.
+            httpGet: { path: /healthz, port: 8080 }
+            periodSeconds: 10
+            failureThreshold: 3
+      volumes:
+        - name: config
+          configMap: { name: gateway-config }

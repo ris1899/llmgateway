@@ -1,0 +1,26 @@
+# Single pod, no persistence: cache/rate-limit state here is fine to lose on
+# restart (cache just gets cold, rate limits reset).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redis
+  namespace: llmgateway
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: redis } }
+  template:
+    metadata: { labels: { app: redis } }
+    spec:
+      containers:
+        - name: redis
+          image: redis:7-alpine
+          ports: [{ containerPort: 6379 }]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis
+  namespace: llmgateway
+spec:
+  selector: { app: redis }
+  ports: [{ port: 6379, targetPort: 6379 }]

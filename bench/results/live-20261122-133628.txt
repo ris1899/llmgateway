@@ -1,0 +1,60 @@
+== 0. Network: can we reach the providers? (no keys sent)
+  401  https://api.groq.com/openai/v1/models
+  404  https://generativelanguage.googleapis.com/v1beta/openai/models
+
+== 1. Keys + model names
+  groq   key: HTTP 200 (200 = key OK)
+  groq   model openai/gpt-oss-20b: found
+  gemini key: HTTP 200 (200 = key OK)
+  gemini model gemini-flash-lite-latest: found
+
+== 2. Start gateway
+  gateway up (log: /tmp/live-gateway.log)
+
+== 3. Each real provider, non-streaming
+  live-groq      HTTP/1.1 200 OK | Attempts: 1 Provider: groq/openai/gpt-oss-20b Upstream-Ms: 786.085 
+      -> Hello, nice to meet you.
+  live-gemini    HTTP/1.1 200 OK | Attempts: 1 Provider: gemini/gemini-flash-lite-latest Upstream-Ms: 2562.458 
+      -> Hello there, how are you?
+
+== 4. Streaming (Groq)
+  data lines: 15   ended with [DONE]: yes
+    data: {"id":"chatcmpl-5d8edece857b93f6bdc0938b7d705433","object":"chat.completion.chunk","created":1795334794,"model":"live-groq","choices":
+    
+    data: {"id":"chatcmpl-5d8edece857b93f6bdc0938b7d705433","object":"chat.completion.chunk","created":1795334794,"model":"live-groq","choices":
+
+== 5. Real failover: primary (Gemini) has a 1ms timeout, Groq must answer
+   expect: first ~5 attempts=2 (timeout, then failover); after that attempts=1 (breaker open, primary skipped)
+  live-failover  HTTP/1.1 200 OK | Attempts: 2 Provider: groq/openai/gpt-oss-20b Upstream-Ms: 581.076 
+      -> Hello world, how are you?
+  live-failover  HTTP/1.1 200 OK | Attempts: 2 Provider: groq/openai/gpt-oss-20b Upstream-Ms: 576.509 
+      -> Hello world, how are you?
+  live-failover  HTTP/1.1 200 OK | Attempts: 2 Provider: groq/openai/gpt-oss-20b Upstream-Ms: 672.221 
+      -> Hi there, how are you?
+  live-failover  HTTP/1.1 200 OK | Attempts: 2 Provider: groq/openai/gpt-oss-20b Upstream-Ms: 639.214 
+      -> Hello, how are you doing?
+  live-failover  HTTP/1.1 200 OK | Attempts: 2 Provider: groq/openai/gpt-oss-20b Upstream-Ms: 616.634 
+      -> Hey there, how are you?
+  live-failover  HTTP/1.1 200 OK | Attempts: 2 Provider: groq/openai/gpt-oss-20b Upstream-Ms: 569.528 
+      -> Greetings! How may I assist?
+  live-failover  HTTP/1.1 200 OK | Attempts: 2 Provider: groq/openai/gpt-oss-20b Upstream-Ms: 612.538 
+      -> Hello there, how are you?
+
+== 6. Fastest strategy: which provider does it pick?
+  live-fast      HTTP/1.1 200 OK | Attempts: 1 Provider: groq/openai/gpt-oss-20b Upstream-Ms: 747.129 
+      -> Hi everyone! Wishing you joy.
+  live-fast      HTTP/1.1 200 OK | Attempts: 1 Provider: groq/openai/gpt-oss-20b Upstream-Ms: 952.497 
+      -> Hi there, how’s it going?
+  live-fast      HTTP/1.1 200 OK | Attempts: 1 Provider: groq/openai/gpt-oss-20b Upstream-Ms: 731.233 
+      -> Hello everyone, hope you're well.
+  live-fast      HTTP/1.1 200 OK | Attempts: 1 Provider: groq/openai/gpt-oss-20b Upstream-Ms: 615.929 
+      -> Hi there, how are you?
+  live-fast      HTTP/1.1 200 OK | Attempts: 1 Provider: groq/openai/gpt-oss-20b Upstream-Ms: 774.326 
+      -> Hello, how are you today?
+  live-fast      HTTP/1.1 200 OK | Attempts: 1 Provider: gemini/gemini-flash-lite-latest Upstream-Ms: 923.109 
+      -> Hello there, how are you?
+
+== 7. Gateway's view (/admin/deployments)
+[{"group":"live-chat","id":"groq/openai/gpt-oss-20b","breaker":"closed","base_p50_ms":0,"base_p95_ms":0,"tpot_ms":0,"samples":0,"window_requests":0,"window_failures":0,"error_rate":0,"in_flight":0},{"group":"live-chat","id":"gemini/gemini-flash-lite-latest","breaker":"closed","base_p50_ms":0,"base_p95_ms":0,"tpot_ms":0,"samples":0,"window_requests":0,"window_failures":0,"error_rate":0,"in_flight":0},{"group":"live-failover","id":"gemini-broken/gemini-flash-lite-latest","breaker":"open","base_p50_ms":0,"base_p95_ms":0,"tpot_ms":0,"samples":0,"window_requests":0,"window_failures":0,"error_rate":0,"in_flight":0},{"group":"live-failover","id":"groq/openai/gpt-oss-20b","breaker":"closed","base_p50_ms":611.236,"base_p95_ms":670.99,"tpot_ms":0,"samples":7,"window_requests":0,"window_failures":0,"error_rate":0,"in_flight":0},{"group":"live-fast","id":"groq/openai/gpt-oss-20b","breaker":"closed","base_p50_ms":747.093,"base_p95_ms":952.456,"tpot_ms":0,"samples":5,"window_requests":1,"window_failures":0,"error_rate":0,"in_flight":0},{"group":"live-fast","id":"gemini/gemini-flash-lite-latest","breaker":"closed","base_p50_ms":923.075,"base_p95_ms":923.075,"tpot_ms":0,"samples":1,"window_requests":1,"window_failures":0,"error_rate":0,"in_flight":0},{"group":"live-gemini","id":"gemini/gemini-flash-lite-latest","breaker":"closed","base_p50_ms":2562.393,"base_p95_ms":2562.393,"tpot_ms":0,"samples":1,"window_requests":0,"window_failures":0,"error_rate":0,"in_flight":0},{"group":"live-groq","id":"groq/openai/gpt-oss-20b","breaker":"closed","base_p50_ms":786.012,"base_p95_ms":786.012,"tpot_ms":0.224,"samples":2,"window_requests":0,"window_failures":0,"error_rate":0,"in_flight":0}]
+
+Saved to bench/results/live-20261122-133628.txt
