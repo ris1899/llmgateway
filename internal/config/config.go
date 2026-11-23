@@ -1,15 +1,7 @@
-// Package config loads and validates the gateway's YAML config.
-//
-// Design rules:
-//   - Secrets never live in the file. Fields ending in _env name an env var
-//     that we resolve at load time, so the YAML is safe to commit.
-//   - Unknown fields are an error. A typo like "timout" silently falling back to
-//     a default is the kind of bug you find in production at 3am.
-//   - Validate everything up front and report all problems at once, so the
-//     process either starts with a coherent config or refuses to start.
-//   - Every infrastructure dependency is optional. No redis.addr = no cache and
-//     no rate limits; no usage.brokers = no usage events. That keeps `make run`
-//     dependency-free and lets benchmarks isolate one component at a time.
+// Package config loads and validates the gateway's YAML config. Secrets stay
+// out of the file: fields ending in _env name an env var resolved at load
+// time. Unknown fields are a load error, and every infrastructure dependency
+// (redis, usage brokers) is optional so `make run` works with zero deps.
 package config
 
 import (
@@ -30,70 +22,49 @@ type Config struct {
 	Auth      Auth                `yaml:"auth"`
 	Usage     Usage               `yaml:"usage"`
 	Providers map[string]Provider `yaml:"providers"`
-	// Models maps a public model name (what clients send in "model") to the
-	// deployments that can serve it. A name with several deployments is a
-	// "model group": interchangeable models the router can choose between.
+	// Models maps a public model name to the deployments that can serve it;
+	// several deployments make it a "model group" the router picks between.
 	Models map[string]Model `yaml:"models"`
 }
 
 type Server struct {
 	Addr              string        `yaml:"addr"`
 	ReadHeaderTimeout time.Duration `yaml:"read_header_timeout"`
-	// No WriteTimeout field on purpose: net/http's WriteTimeout is a hard cap on
-	// the whole response, which would kill long SSE streams. Per-request
-	// deadlines are enforced in the handler instead.
+	// no WriteTimeout field: it's a hard cap on the whole response and would
+	// kill long SSE streams; deadlines are enforced per-request in the handler instead
 	IdleTimeout     time.Duration `yaml:"idle_timeout"`
 	ShutdownTimeout time.Duration `yaml:"shutdown_timeout"`
 	MaxBodyBytes    int64         `yaml:"max_body_bytes"`
-	// RequestTimeout bounds a whole non-streaming request across all failover
-	// attempts, so a chain of slow providers can't hold a client forever.
-	RequestTimeout time.Duration `yaml:"request_timeout"`
-	// MetricsAddr serves /metrics, /admin/deployments and pprof on a separate
-	// port so they are never exposed through the public load balancer.
-	MetricsAddr string `yaml:"metrics_addr"`
+	RequestTimeout  time.Duration `yaml:"request_timeout"` // bounds a request across all failover attempts
+	MetricsAddr     string        `yaml:"metrics_addr"`    // separate port, never exposed through the public LB
 }
 
 type Router struct {
-	Breaker     Breaker     `yaml:"breaker"`
-	RetryBudget RetryBudget `yaml:"retry_budget"`
-	// StatsWindow is how far back error rates look. Short = reacts fast but
-	// noisy; long = stable but slow to notice recovery.
-	StatsWindow time.Duration `yaml:"stats_window"`
-	// SessionTTL: how long an idle conversation stays sticky to its
-	// deployment. Provider prompt caches expire after minutes of idleness, so
-	// remembering much longer buys nothing.
+	Breaker     Breaker       `yaml:"breaker"`
+	RetryBudget RetryBudget   `yaml:"retry_budget"`
+	StatsWindow time.Duration `yaml:"stats_window"` // how far back error rates look; short reacts fast but noisy
+	// how long an idle conversation stays sticky; provider prompt caches expire
+	// within minutes anyway, so remembering longer buys nothing
 	SessionTTL time.Duration `yaml:"session_ttl"`
 }
 
 type Breaker struct {
-	// Trip on N consecutive failures: catches a hard-down provider within a
-	// handful of requests, regardless of traffic volume.
-	ConsecutiveFailures int `yaml:"consecutive_failures"`
-	// ...or on an error rate over the stats window: catches a provider that is
-	// failing a large share of requests but not every single one.
-	ErrorRate   float64 `yaml:"error_rate"`
-	MinRequests int     `yaml:"min_requests"` // don't judge error rate on tiny samples
-	// Cooldown before letting probe requests test an open breaker.
-	Cooldown time.Duration `yaml:"cooldown"`
-	// HalfOpenSuccesses consecutive probe successes are needed to close again,
-	// so one lucky request doesn't flip a flapping provider back on.
-	HalfOpenSuccesses int `yaml:"half_open_successes"`
+	ConsecutiveFailures int           `yaml:"consecutive_failures"` // trips fast on a hard-down provider regardless of volume
+	ErrorRate           float64       `yaml:"error_rate"`           // or trips on error share over the stats window
+	MinRequests         int           `yaml:"min_requests"`         // don't judge error rate on tiny samples
+	Cooldown            time.Duration `yaml:"cooldown"`             // before letting probe requests test an open breaker
+	HalfOpenSuccesses   int           `yaml:"half_open_successes"`  // consecutive successes needed to close again
 }
 
 type RetryBudget struct {
-	// Ratio of extra attempts (failovers + hedges) allowed per original
-	// request. 0.2 means retries can add at most ~20% load.
-	Ratio float64 `yaml:"ratio"`
-	// MinPerSec lets low-traffic gateways still retry.
-	MinPerSec float64 `yaml:"min_per_sec"`
+	Ratio     float64 `yaml:"ratio"`       // extra attempts allowed per request; 0.2 = retries add at most ~20% load
+	MinPerSec float64 `yaml:"min_per_sec"` // lets low-traffic gateways still retry
 }
 
 type Redis struct {
-	Addr        string `yaml:"addr"` // empty = Redis features disabled
-	PasswordEnv string `yaml:"password_env"`
-	// OpTimeout caps every Redis call. Redis is on the hot path for cache and
-	// rate limits, so a slow Redis must degrade to "skip", never to "slow".
-	OpTimeout time.Duration `yaml:"op_timeout"`
+	Addr        string        `yaml:"addr"` // empty = Redis features disabled
+	PasswordEnv string        `yaml:"password_env"`
+	OpTimeout   time.Duration `yaml:"op_timeout"` // caps every Redis call; a slow Redis must degrade to skip, not slow
 
 	Password string `yaml:"-"`
 }
@@ -101,9 +72,8 @@ type Redis struct {
 type Cache struct {
 	Enabled bool          `yaml:"enabled"`
 	TTL     time.Duration `yaml:"ttl"`
-	// Only requests with an explicit temperature <= this are cached. Unset
-	// temperature means the provider default (1.0 for OpenAI), i.e. the client
-	// expects varied answers, so it is never cached.
+	// only requests with an explicit temperature <= this are cached; unset
+	// temperature means the client wants varied answers, so never cache it
 	MaxTemperature float64 `yaml:"max_temperature"`
 }
 
@@ -153,9 +123,8 @@ type Provider struct {
 	Type      string `yaml:"type"`
 	BaseURL   string `yaml:"base_url"`
 	APIKeyEnv string `yaml:"api_key_env"`
-	// Timeout is a per-attempt "no progress" timeout: max time to first byte,
-	// and max silence between streamed chunks. It is also the worst-case time
-	// to detect a hung provider, so it directly bounds failover time.
+	// per-attempt no-progress timeout: max time to first byte or between
+	// streamed chunks, so it also bounds failover time
 	Timeout time.Duration `yaml:"timeout"`
 
 	APIKey string `yaml:"-"` // resolved from APIKeyEnv at load; never serialized
@@ -164,10 +133,8 @@ type Provider struct {
 type Model struct {
 	Strategy        string `yaml:"strategy"`          // default strategy; header can override
 	LatencyTargetMs int    `yaml:"latency_target_ms"` // for "cheapest"
-	// HedgeAfter > 0 enables hedged requests (non-streaming only): if the first
-	// attempt hasn't answered by then, a second one starts on the next
-	// deployment and the first answer wins. Cuts tail latency, costs money:
-	// both attempts can be billed.
+	// > 0 enables hedged requests (non-streaming only): a second attempt starts
+	// on the next deployment if the first hasn't answered; cuts tail latency, costs money
 	HedgeAfter  time.Duration `yaml:"hedge_after"`
 	Deployments []Deployment  `yaml:"deployments"`
 }
@@ -175,8 +142,7 @@ type Model struct {
 type Deployment struct {
 	Provider string `yaml:"provider"`
 	Model    string `yaml:"model"` // upstream model id sent to the provider
-	// Prices in USD per 1M tokens, copied from provider pricing pages. Kept in
-	// config rather than code because they change and differ per account.
+	// USD per 1M tokens; kept in config since prices change and differ per account
 	InputPricePerM  float64 `yaml:"input_price_per_m"`
 	OutputPricePerM float64 `yaml:"output_price_per_m"`
 	Priority        int     `yaml:"priority"` // lower = preferred (priority strategy)
@@ -265,8 +231,7 @@ func (c *Config) resolveSecrets(lookupEnv func(string) (string, bool)) error {
 		}
 		v, ok := lookupEnv(env)
 		if !ok || v == "" {
-			// Missing secrets are an error, not a warning: a provider that will 401
-			// on every call would just feed the circuit breaker garbage.
+			// missing secret is an error, not a warning: a 401'ing provider just feeds the breaker garbage
 			errs = append(errs, fmt.Errorf("%s: env var %s is not set", what, env))
 			return
 		}
@@ -316,6 +281,7 @@ func (c *Config) validate() error {
 		if len(m.Deployments) == 0 {
 			add("model %q: no deployments", name)
 		}
+		seen := make(map[string]bool, len(m.Deployments))
 		for i, d := range m.Deployments {
 			where := fmt.Sprintf("model %q deployment %d", name, i)
 			if _, ok := c.Providers[d.Provider]; !ok {
@@ -330,14 +296,44 @@ func (c *Config) validate() error {
 			if d.Weight < 0 {
 				add("%s: weight must be >= 0", where)
 			}
+			// same (provider, model) twice in a group is almost always a copy-paste mistake
+			key := d.Provider + "/" + d.Model
+			if d.Provider != "" && d.Model != "" {
+				if seen[key] {
+					add("%s: duplicate deployment %q in model %q", where, key, name)
+				}
+				seen[key] = true
+			}
 		}
+	}
+	if c.Server.ReadHeaderTimeout < 0 || c.Server.IdleTimeout < 0 || c.Server.ShutdownTimeout < 0 ||
+		c.Server.RequestTimeout < 0 || c.Server.MaxBodyBytes < 0 {
+		add("server timeouts and max_body_bytes must be >= 0")
 	}
 	b := c.Router.Breaker
 	if b.ErrorRate <= 0 || b.ErrorRate > 1 {
 		add("router.breaker.error_rate must be in (0,1]")
 	}
+	if b.ConsecutiveFailures < 0 || b.MinRequests < 0 || b.Cooldown < 0 || b.HalfOpenSuccesses < 0 {
+		add("router.breaker values must be >= 0")
+	}
 	if c.Router.RetryBudget.Ratio < 0 || c.Router.RetryBudget.MinPerSec < 0 {
 		add("router.retry_budget values must be >= 0")
+	}
+	if c.Router.StatsWindow < 0 || c.Router.SessionTTL < 0 {
+		add("router.stats_window and router.session_ttl must be >= 0")
+	}
+	if c.Redis.OpTimeout < 0 {
+		add("redis.op_timeout must be >= 0")
+	}
+	if c.Cache.TTL < 0 || c.Cache.MaxTemperature < 0 {
+		add("cache.ttl and cache.max_temperature must be >= 0")
+	}
+	if c.Auth.CacheTTL < 0 {
+		add("auth.cache_ttl must be >= 0")
+	}
+	if c.Usage.MaxBuffered < 0 {
+		add("usage.max_buffered must be >= 0")
 	}
 	if c.Cache.Enabled && c.Redis.Addr == "" {
 		add("cache.enabled requires redis.addr")

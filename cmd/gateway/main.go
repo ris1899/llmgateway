@@ -26,8 +26,7 @@ import (
 )
 
 func main() {
-	// run() returns an error instead of calling os.Exit deep inside, so deferred
-	// cleanups always execute and the startup path stays testable.
+	// error return instead of os.Exit deep inside keeps defers running and the path testable.
 	if err := run(); err != nil {
 		slog.Error("fatal", "err", err)
 		os.Exit(1)
@@ -43,8 +42,7 @@ func run() error {
 	if err := lvl.UnmarshalText([]byte(*logLevel)); err != nil {
 		return err
 	}
-	// JSON logs: machine-parseable by Loki/CloudWatch, and request_id is a real
-	// field you can filter on, not a substring.
+	// JSON so request_id is a filterable field in Loki/CloudWatch, not a substring.
 	log := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: lvl}))
 	slog.SetDefault(log)
 
@@ -69,14 +67,16 @@ func run() error {
 	if cfg.Redis.Addr != "" {
 		rdb = redis.NewClient(&redis.Options{
 			Addr: cfg.Redis.Addr, Password: cfg.Redis.Password,
-			// Pool sized for high concurrency: each in-flight request may hold a
-			// connection briefly for cache + rate limit.
+			// each request can hold a connection briefly for cache + rate limit
 			PoolSize: 256, MinIdleConns: 16,
 			ReadTimeout: cfg.Redis.OpTimeout, WriteTimeout: cfg.Redis.OpTimeout,
 		})
-		defer rdb.Close()
-		// Not fatal if Redis is down at startup: cache and limits fail open, and
-		// go-redis reconnects on its own.
+		defer func() {
+			if err := rdb.Close(); err != nil {
+				log.Warn("redis client close", "err", err)
+			}
+		}()
+		// not fatal: cache and limits fail open, go-redis reconnects on its own
 		pctx, cancel := context.WithTimeout(ctx, 2*time.Second)
 		if err := rdb.Ping(pctx).Err(); err != nil {
 			log.Warn("redis not reachable at startup; cache and limits will fail open", "err", err)
@@ -111,14 +111,12 @@ func run() error {
 			return err
 		}
 		sink = p
-		// Closed after the HTTP server drains (defers run in reverse), so events
-		// from the last in-flight requests are flushed too.
+		// defers run in reverse, so this closes after the server drains and flushes the last events
 		defer p.Close()
 	}
 
-	// Sticky routing is always available (opt-in per request via header).
-	// Redis when configured, so all replicas share the mapping; otherwise
-	// in memory, which is correct for a single instance.
+	// sticky routing is opt-in per request via header; Redis shares the mapping
+	// across replicas when configured, otherwise in-memory is fine for one instance
 	var sessions gateway.SessionStore = gateway.NewMemorySessions(cfg.Router.SessionTTL)
 	if rdb != nil {
 		sessions = gateway.NewRedisSessions(rdb, cfg.Router.SessionTTL, cfg.Redis.OpTimeout)
@@ -155,13 +153,10 @@ func run() error {
 	case <-ctx.Done():
 	}
 
-	// Graceful shutdown, in Kubernetes order:
-	//  1. Fail readiness so the load balancer stops routing new requests here.
-	//  2. Wait briefly: endpoint removal propagates asynchronously, so for a
-	//     moment traffic still arrives. Closing the listener now would refuse it.
-	//  3. Shutdown: stop accepting, wait for in-flight requests (incl. streams)
-	//     up to the timeout, then exit. Deferred closes flush usage events.
-	stop() // a second Ctrl-C now kills immediately instead of being swallowed
+	// shutdown order: fail readiness, wait for endpoint removal to propagate
+	// (otherwise we refuse traffic that's still inbound), then Shutdown drains
+	// in-flight requests/streams and the deferred closes flush usage events.
+	stop() // second Ctrl-C now kills immediately instead of being swallowed
 	log.Info("shutting down")
 	srv.SetReady(false)
 	time.Sleep(drainDelay())
@@ -176,8 +171,8 @@ func run() error {
 	return nil
 }
 
-// waitFor retries a dependency at startup (compose starts containers in
-// parallel; Postgres may need a few seconds).
+// waitFor retries a dependency at startup; compose starts containers in
+// parallel so Postgres may not be ready yet.
 func waitFor(ctx context.Context, log *slog.Logger, what string, f func(context.Context) error) error {
 	deadline := time.Now().Add(30 * time.Second)
 	for {

@@ -99,8 +99,6 @@ func New(name string, b Behavior) (*Server, error) {
 
 func (s *Server) Handler() http.Handler { return s.mux }
 
-// --- admin ---
-
 func (s *Server) handleGetBehavior(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, s.behavior.Load())
 }
@@ -121,10 +119,8 @@ func (s *Server) handlePatchBehavior(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, &b)
 }
 
-// --- shared request handling ---
-
-// prelude applies faults, latency and injected errors. It returns false when
-// the request has already been answered (error) or abandoned (fault, client gone).
+// prelude applies faults, latency and injected errors; returns false once the
+// request is already answered or abandoned.
 func (s *Server) prelude(w http.ResponseWriter, r *http.Request, b *Behavior, writeErr func(http.ResponseWriter, int, string)) bool {
 	s.requests.Add(1)
 	switch b.Fault {

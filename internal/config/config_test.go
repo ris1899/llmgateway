@@ -63,7 +63,7 @@ func TestParseErrors(t *testing.T) {
 		name    string
 		yaml    string
 		env     map[string]string
-		wantErr []string // every substring must appear: we report all errors at once
+		wantErr []string // every substring must appear
 	}{
 		{
 			name:    "missing secret",
@@ -102,6 +102,73 @@ models:
 			yaml:    "{}",
 			wantErr: []string{"no providers configured", "no models configured"},
 		},
+		{
+			name: "invalid strategy",
+			yaml: `
+providers:
+  mock:
+    type: openai
+    base_url: http://localhost:9000/v1
+models:
+  m:
+    strategy: bogus
+    deployments:
+      - provider: mock
+        model: mock-small
+`,
+			wantErr: []string{`unknown strategy "bogus"`},
+		},
+		{
+			name: "negative provider timeout",
+			yaml: `
+providers:
+  mock:
+    type: openai
+    base_url: http://localhost:9000/v1
+    timeout: -1s
+models:
+  m:
+    deployments:
+      - provider: mock
+        model: mock-small
+`,
+			wantErr: []string{`timeout must be positive`},
+		},
+		{
+			name: "negative router timings",
+			yaml: `
+providers:
+  mock:
+    type: openai
+    base_url: http://localhost:9000/v1
+models:
+  m:
+    deployments:
+      - provider: mock
+        model: mock-small
+router:
+  stats_window: -1s
+  session_ttl: -1s
+`,
+			wantErr: []string{"router.stats_window and router.session_ttl must be >= 0"},
+		},
+		{
+			name: "duplicate deployment in a model group",
+			yaml: `
+providers:
+  mock:
+    type: openai
+    base_url: http://localhost:9000/v1
+models:
+  m:
+    deployments:
+      - provider: mock
+        model: mock-small
+      - provider: mock
+        model: mock-small
+`,
+			wantErr: []string{`duplicate deployment "mock/mock-small"`},
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -118,8 +185,7 @@ models:
 	}
 }
 
-// The example config shipped in the repo must always load, so a new developer's
-// first run never fails on a stale example.
+// guards against a stale example breaking a new developer's first run
 func TestExampleConfigLoads(t *testing.T) {
 	path := filepath.Join("..", "..", "config.example.yaml")
 	if _, err := os.Stat(path); err != nil {
