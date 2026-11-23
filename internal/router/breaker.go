@@ -10,9 +10,9 @@ import (
 type State int32
 
 const (
-	Closed   State = iota // normal: traffic flows
-	Open                  // tripped: no traffic until cooldown passes
-	HalfOpen              // testing: one probe at a time decides recovery
+	Closed State = iota
+	Open
+	HalfOpen
 )
 
 func (s State) String() string {
@@ -31,29 +31,11 @@ type Outcome int
 const (
 	Success Outcome = iota
 	Failure
-	Neutral // says nothing about provider health (bad request, client left)
+	Neutral // bad request, client left: says nothing about provider health
 )
 
-// Breaker is a per-deployment circuit breaker.
-//
-// Why it exists: without it, every request to a dead provider pays the full
-// failure cost (a timeout for a hung provider) before failing over. With it,
-// after a few failures the provider is skipped entirely and requests go
-// straight to a healthy one. That turns "every request waits 5s" into "a
-// handful of requests wait 5s".
-//
-// Two trip conditions, because they catch different failures:
-//   - N consecutive failures: hard-down provider; trips within N requests.
-//   - error rate over the window: a provider failing 60% of calls never
-//     produces 5 failures in a row reliably, but is still unusable.
-//
-// Recovery: after Cooldown, half-open lets ONE probe through at a time and
-// needs several consecutive successes to close. One probe at a time means a
-// still-dead provider costs one request per probe, not a burst.
-//
-// A mutex rather than atomics: the critical sections are a few instructions,
-// contention is per deployment, and a lock-free state machine with probe
-// accounting is much harder to get right.
+// Breaker is a per-deployment circuit breaker: skips a dead provider instead
+// of paying its full timeout per request; recovers via single probes.
 type Breaker struct {
 	mu       sync.Mutex
 	cfg      config.Breaker
@@ -75,8 +57,7 @@ func (b *Breaker) State() State {
 	return b.state
 }
 
-// Peek reports whether Allow would admit a request now, without claiming the
-// probe slot. The router uses it to build plans.
+// Peek checks admission without claiming the probe slot.
 func (b *Breaker) Peek(now time.Time) bool {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -90,8 +71,7 @@ func (b *Breaker) Peek(now time.Time) bool {
 	}
 }
 
-// Allow is called right before an attempt. probe=true means this attempt is
-// the half-open probe and its outcome must be reported with probe=true.
+// Allow reports admission; probe=true means report its outcome with probe=true too.
 func (b *Breaker) Allow(now time.Time) (probe, ok bool) {
 	b.mu.Lock()
 	from := b.state
@@ -117,11 +97,10 @@ func (b *Breaker) Allow(now time.Time) (probe, ok bool) {
 	return true, true
 }
 
-// Report feeds an attempt's outcome. n and fails are the deployment's
-// request and failure counts over the stats window.
-func (b *Breaker) Report(now time.Time, probe bool, o Outcome, n, fails int) {
+// Report feeds an outcome and returns (from, to) state for transition handling.
+func (b *Breaker) Report(now time.Time, probe bool, o Outcome, n, fails int) (from, to State) {
 	b.mu.Lock()
-	from := b.state
+	from = b.state
 	if probe {
 		b.probing = false
 	}
@@ -138,9 +117,7 @@ func (b *Breaker) Report(now time.Time, probe bool, o Outcome, n, fails int) {
 			}
 		}
 	case HalfOpen:
-		// Non-probe results arriving now were started before the trip; they
-		// don't tell us whether the provider recovered, so ignore them.
-		if probe {
+		if probe { // non-probe results predate the trip; ignore
 			switch o {
 			case Success:
 				b.probeOK++
@@ -151,20 +128,19 @@ func (b *Breaker) Report(now time.Time, probe bool, o Outcome, n, fails int) {
 				b.trip(now)
 			}
 		}
-	case Open:
-		// Late results from requests started before the trip: ignore.
+	case Open: // late result predating the trip: ignore
 	}
-	to := b.state
+	to = b.state
 	b.mu.Unlock()
 	b.notify(from, to)
+	return from, to
 }
 
 func (b *Breaker) trip(now time.Time) {
 	b.state, b.openedAt, b.consec, b.probing = Open, now, 0, false
 }
 
-// notify runs outside the lock so callbacks (metrics, logs) can't deadlock or
-// slow down other requests.
+// runs outside the lock so callbacks can't deadlock
 func (b *Breaker) notify(from, to State) {
 	if from != to && b.onChange != nil {
 		b.onChange(from, to)

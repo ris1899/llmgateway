@@ -1,7 +1,4 @@
-// Package router decides which deployment serves a request. It owns the live
-// state used for those decisions: per-deployment stats, circuit breakers and
-// the global retry budget. It does not make network calls; the gateway package
-// executes the plan the router returns.
+// Package router decides which deployment serves a request.
 package router
 
 import (
@@ -19,7 +16,7 @@ import (
 )
 
 type Deployment struct {
-	ID              string // "provider/model"
+	ID              string
 	Group           string
 	Provider        provider.Provider
 	Model           string
@@ -32,7 +29,6 @@ type Deployment struct {
 	Breaker *Breaker
 }
 
-// Cost in USD for actual usage.
 func (d *Deployment) Cost(u llm.Usage) float64 {
 	return d.costFor(u.InputTokens, u.OutputTokens)
 }
@@ -51,8 +47,6 @@ type Group struct {
 	avgOut atomic.Uint64 // float64 bits: EWMA of output tokens, for predictions
 }
 
-// ObserveOutput updates the group's typical answer length. A benign race
-// (two concurrent updates, one lost) is fine for an average.
 func (g *Group) ObserveOutput(tokens int) {
 	old := math.Float64frombits(g.avgOut.Load())
 	v := float64(tokens)
@@ -62,27 +56,21 @@ func (g *Group) ObserveOutput(tokens int) {
 	g.avgOut.Store(math.Float64bits(v))
 }
 
-// expectedOutput guesses how many tokens this request will produce: the
-// group's typical answer length, capped by max_tokens.
 func (g *Group) expectedOutput(req *llm.ChatRequest) int {
 	avg := int(math.Float64frombits(g.avgOut.Load()))
 	if avg == 0 {
 		avg = 256
 	}
-	if req.MaxTokens != nil && *req.MaxTokens < avg {
+	if req.MaxTokens != nil && *req.MaxTokens > 0 && *req.MaxTokens < avg {
 		return *req.MaxTokens
 	}
 	return avg
 }
 
-// Policy is the per-request routing choice: header > API key default > model default.
 type Policy struct {
 	Strategy      string
 	LatencyTarget time.Duration
-	// Prefer is a deployment id to try first (sticky routing): the one that
-	// served this conversation's last turn. Ignored if that deployment's
-	// breaker is open, so stickiness never overrides health.
-	Prefer string
+	Prefer        string // sticky deployment id; ignored if its breaker is open
 }
 
 type Router struct {
@@ -91,8 +79,6 @@ type Router struct {
 	explore float64
 }
 
-// ErrNoHealthy means every deployment for the model has an open breaker.
-// Failing fast is the point: waiting on known-dead providers helps nobody.
 var ErrNoHealthy = errors.New("no healthy deployment")
 
 func New(groups map[string]*Group, budget *Budget) *Router {
@@ -101,9 +87,7 @@ func New(groups map[string]*Group, budget *Budget) *Router {
 			return g.Deployments[i].Priority < g.Deployments[j].Priority
 		})
 	}
-	// 2% exploration: with "fastest"/"cheapest", a deployment that looked slow
-	// once would otherwise never get traffic again, so its stats would never
-	// update. A small random share keeps every deployment's data fresh.
+	// small random share so a deployment that once looked slow isn't starved forever
 	return &Router{groups: groups, Budget: budget, explore: 0.02}
 }
 
@@ -121,7 +105,6 @@ func (r *Router) GroupNames() []string {
 	return names
 }
 
-// Resolve fills in defaults from the group.
 func (r *Router) Resolve(g *Group, p Policy) Policy {
 	if p.Strategy == "" {
 		p.Strategy = g.Strategy
@@ -136,28 +119,23 @@ type candidate struct {
 	d         *Deployment
 	predicted time.Duration
 	known     bool
-	score     float64 // predicted latency adjusted for error rate
-	cost      float64 // expected USD for this request
+	score     float64
+	cost      float64
 }
 
-// Plan returns deployments in the order they should be tried. Returning an
-// ordered list (not one pick) makes failover just "walk the list".
 func (r *Router) Plan(g *Group, p Policy, req *llm.ChatRequest) []*Deployment {
 	now := time.Now()
 	expOut := g.expectedOutput(req)
 	inTok := estimateInputTokens(req)
 
 	cands := make([]candidate, 0, len(g.Deployments))
-	for _, d := range g.Deployments { // already in priority order
+	for _, d := range g.Deployments {
 		if !d.Breaker.Peek(now) {
 			continue
 		}
 		snap := d.Stats.Snapshot(now)
 		pred, known := snap.Predict(expOut)
-		// Expected time including failures: with error rate p, a request needs
-		// 1/(1-p) attempts on average. A fast provider failing 50% of calls is
-		// effectively twice as slow.
-		score := float64(pred) / (1 - min(snap.ErrorRate, 0.9))
+		score := float64(pred) / (1 - min(snap.ErrorRate, 0.9)) // expected time incl. retries at this error rate
 		cands = append(cands, candidate{d: d, predicted: pred, known: known, score: score,
 			cost: d.costFor(inTok, expOut)})
 	}
@@ -171,12 +149,10 @@ func (r *Router) Plan(g *Group, p Policy, req *llm.ChatRequest) []*Deployment {
 		r.maybeExplore(cands)
 	case config.StrategyWeighted:
 		rankWeighted(cands, rand.Float64())
-	default: // priority: already ordered
+	default:
 	}
 
-	// Applied last, after strategy and exploration: a conversation stays on
-	// its deployment even if the strategy would now rank another one first.
-	// The rest of the plan keeps strategy order, so failover still works.
+	// applied last so stickiness overrides strategy order, not failover order
 	if p.Prefer != "" {
 		for i, c := range cands {
 			if c.d.ID == p.Prefer {
@@ -194,15 +170,12 @@ func (r *Router) Plan(g *Group, p Policy, req *llm.ChatRequest) []*Deployment {
 	return out
 }
 
-// Unknown latency sorts first (score 0): optimistic, so a new or recovered
-// deployment gets traffic and quickly earns real stats.
+// unknown latency sorts first (score 0) so new/recovered deployments get traffic
 func rankFastest(c []candidate) {
 	sort.SliceStable(c, func(i, j int) bool { return c[i].score < c[j].score })
 }
 
-// rankCheapest: deployments predicted to meet the target, cheapest first;
-// then the rest, fastest first, so a request still lands somewhere sensible
-// when nothing meets the target. target 0 = pure cheapest.
+// cheapest among those meeting target, then fastest; target 0 = pure cheapest
 func rankCheapest(c []candidate, target time.Duration) {
 	meets := func(x candidate) bool {
 		return target == 0 || !x.known || time.Duration(x.score) <= target
@@ -223,8 +196,7 @@ func rankCheapest(c []candidate, target time.Duration) {
 	})
 }
 
-// rankWeighted picks the first deployment at random by weight; the rest stay
-// in priority order as fallbacks. u is a uniform random number in [0,1).
+// u is uniform in [0,1); rest stay in priority order as fallbacks
 func rankWeighted(c []candidate, u float64) {
 	total := 0
 	for _, x := range c {
@@ -252,8 +224,7 @@ func (r *Router) maybeExplore(c []candidate) {
 	}
 }
 
-// ~4 characters per token: rough, but only used to rank deployments by
-// expected cost, where the same error applies to every candidate.
+// ~4 chars/token; used only for ranking, where the error applies to every candidate equally
 func estimateInputTokens(req *llm.ChatRequest) int {
 	n := 0
 	for _, m := range req.Messages {
@@ -262,7 +233,6 @@ func estimateInputTokens(req *llm.ChatRequest) int {
 	return n/4 + 1
 }
 
-// Classify maps an attempt error to a health outcome.
 func Classify(err error) Outcome {
 	if err == nil {
 		return Success
@@ -273,7 +243,6 @@ func Classify(err error) Outcome {
 	return Neutral
 }
 
-// Record feeds one attempt's outcome into stats and the breaker.
 func (r *Router) Record(d *Deployment, probe bool, err error) {
 	now := time.Now()
 	o := Classify(err)
@@ -281,10 +250,12 @@ func (r *Router) Record(d *Deployment, probe bool, err error) {
 		d.Stats.addResult(o == Success, now)
 	}
 	n, fails := d.Stats.counts(now)
-	d.Breaker.Report(now, probe, o, n, fails)
+	from, to := d.Breaker.Report(now, probe, o, n, fails)
+	if from == HalfOpen && to == Closed { // clear stale outage failures, else the next one re-trips
+		d.Stats.resetErrors()
+	}
 }
 
-// DeploymentStatus is the admin/debug view of one deployment.
 type DeploymentStatus struct {
 	Group     string  `json:"group"`
 	ID        string  `json:"id"`

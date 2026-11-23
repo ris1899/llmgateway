@@ -8,27 +8,15 @@ import (
 )
 
 const (
-	latencySamples = 256 // ring buffer size for percentile estimates
-	minSamples     = 5   // below this a deployment's latency is "unknown"
-	errBuckets     = 10  // error window resolution: window/10 per bucket
-	// Percentiles are recomputed at most this often. Sorting 256 samples on
-	// every request would cost more than everything else the router does;
-	// 100ms staleness is irrelevant for routing decisions.
-	snapshotTTL = 100 * time.Millisecond
+	latencySamples = 256
+	minSamples     = 5 // below this, latency is "unknown"
+	errBuckets     = 10
+	snapshotTTL    = 100 * time.Millisecond // percentile recompute throttle
 )
 
-// Stats tracks live health for one deployment.
-//
-// Why "base latency + tokens x TPOT" instead of plain request latency: LLM
-// latency is dominated by how many tokens come back. A provider answering
-// 500-token essays will look "slow" next to one answering "OK", even if it is
-// faster per token. So we split latency into:
-//   - base: time before generation (queueing, prefill, network). For streams
-//     this is time to first token; for non-streaming calls it's estimated as
-//     total - outputTokens*TPOT.
-//   - TPOT: time per output token, learned from streams.
-//
-// and predict a request's latency as baseP95 + expectedTokens*TPOT.
+// Stats tracks live health for one deployment. Latency is split into base
+// (pre-generation) and TPOT (time/output token), so long answers aren't
+// mistaken for slow ones.
 type Stats struct {
 	mu        sync.Mutex
 	bucketDur time.Duration
@@ -61,8 +49,6 @@ type Snapshot struct {
 	InFlight         int64
 }
 
-// Predict returns expected latency for a request producing expectedOut
-// tokens. known=false means not enough data yet.
 func (s Snapshot) Predict(expectedOut int) (d time.Duration, known bool) {
 	if s.Samples < minSamples {
 		return 0, false
@@ -74,8 +60,7 @@ func NewStats(window time.Duration) *Stats {
 	return &Stats{bucketDur: max(window/errBuckets, time.Millisecond)}
 }
 
-// Error window: a ring of time buckets. Old buckets are lazily reset when
-// their slot is reused, so there is no background goroutine.
+// lazily resets a reused slot; no background goroutine needed
 func (s *Stats) bucket(now time.Time) *errBucket {
 	epoch := now.UnixNano() / int64(s.bucketDur)
 	b := &s.buckets[epoch%errBuckets]
@@ -113,8 +98,6 @@ func (s *Stats) counts(now time.Time) (n, fails int) {
 	return s.countsLocked(now)
 }
 
-// resetErrors runs when the breaker closes, so failures from the outage don't
-// immediately re-trip the error-rate check of a recovered provider.
 func (s *Stats) resetErrors() {
 	s.mu.Lock()
 	s.buckets = [errBuckets]errBucket{}
@@ -129,14 +112,12 @@ func (s *Stats) pushLocked(d time.Duration) {
 	}
 }
 
-// ObserveTTFT records a streaming request's time to first token.
 func (s *Stats) ObserveTTFT(d time.Duration) {
 	s.mu.Lock()
 	s.pushLocked(d)
 	s.mu.Unlock()
 }
 
-// ObserveTPOT records generation speed from a completed stream.
 func (s *Stats) ObserveTPOT(generation time.Duration, tokens int) {
 	if tokens < 2 {
 		return
@@ -151,7 +132,6 @@ func (s *Stats) ObserveTPOT(generation time.Duration, tokens int) {
 	s.mu.Unlock()
 }
 
-// ObserveNonStream records a completed non-streaming request.
 func (s *Stats) ObserveNonStream(total time.Duration, outTokens int) {
 	s.mu.Lock()
 	s.pushLocked(max(0, total-time.Duration(outTokens)*s.tpot))
