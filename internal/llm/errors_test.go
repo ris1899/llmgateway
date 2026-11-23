@@ -19,6 +19,8 @@ func TestErrorClassification(t *testing.T) {
 		{KindUnknown, true, true},
 		{KindBadRequest, false, false},
 		{KindContentFilter, false, false},
+		{KindCanceled, false, false},
+		{KindNotFound, true, false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.kind.String(), func(t *testing.T) {

@@ -1,10 +1,6 @@
-// Package anthropic adapts the Anthropic Messages API. The differences from
-// OpenAI that matter:
-//   - system prompt is a top-level field, not a message
-//   - max_tokens is required
-//   - streaming uses named events; text comes in content_block_delta, input
-//     tokens in message_start and output tokens in message_delta
-//   - errors can also arrive mid-stream as an "error" event (e.g. overloaded)
+// Package anthropic adapts the Messages API: system prompt is top-level,
+// max_tokens required, streaming uses named events, errors can arrive
+// mid-stream as an "error" event.
 package anthropic
 
 import (
@@ -23,9 +19,8 @@ import (
 
 const apiVersion = "2023-06-01"
 
-// Anthropic requires max_tokens; OpenAI-style clients often omit it. This
-// default keeps those requests working while bounding cost.
-const defaultMaxTokens = 1024
+// Anthropic requires max_tokens; OpenAI-style clients routinely omit it.
+const defaultMaxTokens = 4096
 
 type Adapter struct {
 	name    string
@@ -62,8 +57,7 @@ type wireUsage struct {
 	OutputTokens int `json:"output_tokens"`
 }
 
-// Map Anthropic stop reasons onto OpenAI's vocabulary, since our public API
-// speaks OpenAI.
+// Maps Anthropic stop reasons onto OpenAI's vocabulary; our public API speaks OpenAI.
 func finishReason(s string) string {
 	switch s {
 	case "end_turn", "stop_sequence":
@@ -72,8 +66,12 @@ func finishReason(s string) string {
 		return "length"
 	case "refusal":
 		return "content_filter"
+	case "tool_use":
+		return "tool_calls"
+	case "pause_turn":
+		return "stop"
 	default:
-		return s
+		return "stop"
 	}
 }
 
@@ -122,7 +120,7 @@ func (a *Adapter) Chat(ctx context.Context, model string, req *llm.ChatRequest) 
 		return nil, err
 	}
 	defer dl.Release()
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	var w struct {
 		ID      string `json:"id"`
@@ -151,7 +149,7 @@ func (a *Adapter) Chat(ctx context.Context, model string, req *llm.ChatRequest) 
 }
 
 func (a *Adapter) ChatStream(ctx context.Context, model string, req *llm.ChatRequest) (provider.Stream, error) {
-	resp, dl, err := provider.Do(a.hc, a.name, a.timeout, ctx, a.build(model, req, true))
+	resp, dl, err := provider.Do(a.hc, a.name, a.timeout, ctx, a.build(model, req, true)) //nolint:bodyclose // ownership moves to *stream; stream.Close closes it.
 	if err != nil {
 		return nil, err
 	}
@@ -163,7 +161,7 @@ type stream struct {
 	body        io.ReadCloser
 	sse         *provider.SSEReader
 	dl          *provider.Deadline
-	inputTokens int // from message_start, combined with output at message_delta
+	inputTokens int // from message_start
 }
 
 type event struct {
@@ -187,7 +185,7 @@ func (s *stream) Recv() (llm.StreamChunk, error) {
 	for {
 		ev, err := s.sse.Next()
 		if err != nil {
-			if err == io.EOF {
+			if errors.Is(err, io.EOF) {
 				err = io.ErrUnexpectedEOF // must end with message_stop
 			}
 			return llm.StreamChunk{}, provider.TransportError(s.a.name, err, s.dl)
@@ -223,7 +221,6 @@ func (s *stream) Recv() (llm.StreamChunk, error) {
 			}
 			return llm.StreamChunk{}, &llm.Error{Provider: s.a.name, Kind: kind, Err: errors.New(msg)}
 		}
-		// ping, content_block_start/stop: nothing to forward
 	}
 }
 

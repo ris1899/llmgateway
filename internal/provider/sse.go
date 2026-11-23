@@ -3,18 +3,25 @@ package provider
 import (
 	"bufio"
 	"bytes"
+	"errors"
+	"fmt"
 	"io"
+
+	"llmgateway/internal/llm"
 )
 
-// SSEEvent is one Server-Sent Event: optional event name plus data.
 type SSEEvent struct {
 	Event string
 	Data  []byte
 }
 
-// SSEReader parses a text/event-stream body. Events are separated by a blank
-// line; multiple data: lines are joined with "\n"; lines starting with ':' are
-// comments (often keep-alive pings) and are skipped.
+// Bounds a malicious/misbehaving upstream that never sends a blank line
+// from growing our buffer without limit.
+const (
+	maxLineSize  = 1 << 20
+	maxEventSize = 1 << 20
+)
+
 type SSEReader struct {
 	r *bufio.Reader
 }
@@ -23,19 +30,22 @@ func NewSSEReader(r io.Reader) *SSEReader {
 	return &SSEReader{r: bufio.NewReaderSize(r, 32<<10)}
 }
 
-// Next returns the next event, io.EOF at a clean end, or io.ErrUnexpectedEOF if
-// the body ended in the middle of an event (a cut connection).
+// Next returns io.ErrUnexpectedEOF if the body ends mid-event; an oversized
+// line/event reports as a classified llm.Error, not an unbounded read.
 func (s *SSEReader) Next() (SSEEvent, error) {
 	var ev SSEEvent
 	var hasData bool
 	for {
-		line, err := s.r.ReadBytes('\n')
+		line, err := readBoundedLine(s.r, maxLineSize)
 		if err != nil {
-			if err == io.EOF {
+			if errors.Is(err, io.EOF) {
 				if len(bytes.TrimSpace(line)) == 0 && !hasData && ev.Event == "" {
 					return SSEEvent{}, io.EOF
 				}
 				return SSEEvent{}, io.ErrUnexpectedEOF
+			}
+			if errors.Is(err, errLineTooLong) {
+				return SSEEvent{}, &llm.Error{Kind: llm.KindUnavailable, Err: fmt.Errorf("sse: line exceeds %d bytes", maxLineSize)}
 			}
 			return SSEEvent{}, err
 		}
@@ -55,11 +65,38 @@ func (s *SSEReader) Next() (SSEEvent, error) {
 		case "event":
 			ev.Event = string(value)
 		case "data":
+			if len(ev.Data)+len(value)+1 > maxEventSize {
+				return SSEEvent{}, &llm.Error{Kind: llm.KindUnavailable, Err: fmt.Errorf("sse: event exceeds %d bytes", maxEventSize)}
+			}
 			if hasData {
 				ev.Data = append(ev.Data, '\n')
 			}
 			ev.Data = append(ev.Data, value...)
 			hasData = true
 		}
+	}
+}
+
+var errLineTooLong = errors.New("sse: line too long")
+
+// Like bufio.Reader.ReadBytes('\n') but bails out past max instead of
+// growing the buffer unboundedly.
+func readBoundedLine(r *bufio.Reader, max int) ([]byte, error) {
+	var line []byte
+	for {
+		frag, err := r.ReadSlice('\n')
+		if errors.Is(err, bufio.ErrBufferFull) {
+			if len(line)+len(frag) > max {
+				// no skip-to-next-line: that read would be unbounded too
+				return append(line, frag...), errLineTooLong
+			}
+			line = append(line, frag...)
+			continue
+		}
+		if len(line)+len(frag) > max {
+			return append(line, frag...), errLineTooLong
+		}
+		line = append(line, frag...)
+		return line, err
 	}
 }

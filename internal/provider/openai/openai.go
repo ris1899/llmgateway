@@ -1,6 +1,4 @@
-// Package openai adapts any OpenAI-compatible Chat Completions API: OpenAI
-// itself, OpenRouter, Groq, vLLM, Ollama and our mock. Only base_url and the
-// key differ, so one adapter covers all of them.
+// Package openai adapts any OpenAI-compatible Chat Completions API (OpenAI, OpenRouter, Groq, vLLM, Ollama, mock).
 package openai
 
 import (
@@ -11,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 
 	"llmgateway/internal/llm"
@@ -30,8 +29,6 @@ func New(name, baseURL, apiKey string, timeout time.Duration, hc *http.Client) *
 }
 
 func (a *Adapter) Name() string { return a.name }
-
-// --- wire types ---
 
 type wireRequest struct {
 	Model         string        `json:"model"`
@@ -66,10 +63,27 @@ type wireResponse struct {
 		FinishReason *string `json:"finish_reason"`
 	} `json:"choices"`
 	Usage *wireUsage `json:"usage"`
-	// Some compatible servers send errors inside the stream as data events.
-	Error *struct {
+	Error *struct {  // some compatible servers send errors as stream data events
 		Message string `json:"message"`
+		Type    string `json:"type"`
+		Code    string `json:"code"`
 	} `json:"error"`
+}
+
+// Classifies a 200 response that switched to an error mid-stream.
+func inlineErrorKind(typ, code string) llm.ErrorKind {
+	switch {
+	case typ == "invalid_request_error":
+		return llm.KindBadRequest
+	case typ == "rate_limit_error" || code == "rate_limit_exceeded" || code == "429":
+		return llm.KindRateLimited
+	case strings.Contains(typ, "not_found") || code == "model_not_found" || strings.Contains(code, "not_found"):
+		return llm.KindNotFound
+	case typ == "content_filter" || code == "content_filter":
+		return llm.KindContentFilter
+	default:
+		return llm.KindUnavailable
+	}
 }
 
 func (a *Adapter) build(model string, req *llm.ChatRequest, stream bool) func(context.Context) (*http.Request, error) {
@@ -79,9 +93,7 @@ func (a *Adapter) build(model string, req *llm.ChatRequest, stream bool) func(co
 			TopP: req.TopP, MaxTokens: req.MaxTokens, Stop: req.Stop, Stream: stream,
 		}
 		if stream {
-			// Without this, OpenAI sends no token counts in streams and we could
-			// not bill streamed requests accurately.
-			w.StreamOptions = &streamOpts{IncludeUsage: true}
+			w.StreamOptions = &streamOpts{IncludeUsage: true} // else no token counts in stream
 		}
 		body, err := json.Marshal(w)
 		if err != nil {
@@ -105,7 +117,7 @@ func (a *Adapter) Chat(ctx context.Context, model string, req *llm.ChatRequest) 
 		return nil, err
 	}
 	defer dl.Release()
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	var w wireResponse
 	if err := json.NewDecoder(resp.Body).Decode(&w); err != nil {
@@ -125,7 +137,7 @@ func (a *Adapter) Chat(ctx context.Context, model string, req *llm.ChatRequest) 
 }
 
 func (a *Adapter) ChatStream(ctx context.Context, model string, req *llm.ChatRequest) (provider.Stream, error) {
-	resp, dl, err := provider.Do(a.hc, a.name, a.timeout, ctx, a.build(model, req, true))
+	resp, dl, err := provider.Do(a.hc, a.name, a.timeout, ctx, a.build(model, req, true)) //nolint:bodyclose // ownership moves to *stream; stream.Close closes it.
 	if err != nil {
 		return nil, err
 	}
@@ -143,8 +155,7 @@ func (s *stream) Recv() (llm.StreamChunk, error) {
 	for {
 		ev, err := s.sse.Next()
 		if err != nil {
-			// A body that ends without [DONE] is a cut stream, not a clean finish.
-			if err == io.EOF {
+			if errors.Is(err, io.EOF) { // no [DONE]: cut stream, not clean finish
 				err = io.ErrUnexpectedEOF
 			}
 			return llm.StreamChunk{}, provider.TransportError(s.a.name, err, s.dl)
@@ -158,7 +169,8 @@ func (s *stream) Recv() (llm.StreamChunk, error) {
 			return llm.StreamChunk{}, &llm.Error{Provider: s.a.name, Kind: llm.KindUnknown, Err: fmt.Errorf("bad chunk: %w", err)}
 		}
 		if w.Error != nil {
-			return llm.StreamChunk{}, &llm.Error{Provider: s.a.name, Kind: llm.KindUnavailable, Err: errors.New(w.Error.Message)}
+			kind := inlineErrorKind(w.Error.Type, w.Error.Code)
+			return llm.StreamChunk{}, &llm.Error{Provider: s.a.name, Kind: kind, Err: errors.New(w.Error.Message)}
 		}
 		var c llm.StreamChunk
 		if len(w.Choices) > 0 {
@@ -170,9 +182,7 @@ func (s *stream) Recv() (llm.StreamChunk, error) {
 		if w.Usage != nil {
 			c.Usage = &llm.Usage{InputTokens: w.Usage.PromptTokens, OutputTokens: w.Usage.CompletionTokens}
 		}
-		// Skip empty chunks (e.g. the role-only first delta) so that the first
-		// chunk the caller sees is real content.
-		if c.Delta == "" && c.FinishReason == "" && c.Usage == nil {
+		if c.Delta == "" && c.FinishReason == "" && c.Usage == nil { // skip empty (e.g. role-only) deltas
 			continue
 		}
 		return c, nil
