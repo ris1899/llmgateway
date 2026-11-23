@@ -11,19 +11,9 @@ import (
 	"github.com/twmb/franz-go/pkg/kgo"
 )
 
-// Consumer reads usage events and writes them to Postgres exactly once in
-// effect, from at-least-once delivery:
-//
-//  1. Poll a batch.
-//  2. In ONE transaction: insert raw events with ON CONFLICT DO NOTHING
-//     (dedupe by event_id), then add only the newly inserted rows to the
-//     daily aggregates.
-//  3. Commit the transaction, THEN commit Kafka offsets.
-//
-// If we crash between 3a and 3b, the batch is redelivered, every insert hits
-// a conflict, nothing is added twice. If we crash before 3a, the transaction
-// rolls back and the batch is redelivered. Either way aggregates are correct.
-// Committing offsets first instead would lose data on a crash.
+// Consumer gets exactly-once effect from Kafka's at-least-once delivery:
+// insert-dedupe by event_id, aggregate only new rows, commit tx, then
+// commit offsets. A crash anywhere just redelivers the batch as a no-op.
 type Consumer struct {
 	cl  *kgo.Client
 	db  *pgxpool.Pool
@@ -31,18 +21,25 @@ type Consumer struct {
 }
 
 func NewConsumer(brokers []string, topic, group string, db *pgxpool.Pool, log *slog.Logger) (*Consumer, error) {
+	c := &Consumer{db: db, log: log}
 	cl, err := kgo.NewClient(
 		kgo.SeedBrokers(brokers...),
 		kgo.ConsumerGroup(group),
 		kgo.ConsumeTopics(topic),
-		kgo.DisableAutoCommit(), // we commit only after Postgres commits
+		kgo.DisableAutoCommit(),
 		kgo.ConsumeResetOffset(kgo.NewOffset().AtStart()),
 		kgo.AllowAutoTopicCreation(),
+		kgo.OnPartitionsRevoked(func(ctx context.Context, cl *kgo.Client, _ map[string][]int32) {
+			if err := cl.CommitUncommittedOffsets(ctx); err != nil {
+				c.log.Error("offset commit on rebalance revoke failed (safe: redelivery is deduped)", "err", err)
+			}
+		}),
 	)
 	if err != nil {
 		return nil, err
 	}
-	return &Consumer{cl: cl, db: db, log: log}, nil
+	c.cl = cl
+	return c, nil
 }
 
 func (c *Consumer) Run(ctx context.Context) error {
@@ -59,8 +56,6 @@ func (c *Consumer) Run(ctx context.Context) error {
 		fetches.EachRecord(func(r *kgo.Record) {
 			var e Event
 			if err := json.Unmarshal(r.Value, &e); err != nil {
-				// Poison message: log and skip. Retrying it forever would block
-				// the partition. Production: send to a dead-letter topic.
 				c.log.Error("bad usage event, skipping", "offset", r.Offset, "err", err)
 				return
 			}
@@ -85,8 +80,6 @@ func (c *Consumer) writeWithRetry(ctx context.Context, events []Event) error {
 			c.log.Info("usage batch written", "received", len(events), "new", inserted)
 			return nil
 		}
-		// Postgres down: keep retrying the same batch, don't advance offsets.
-		// Kafka retains the backlog, which is the point of having Kafka here.
 		c.log.Error("write failed, retrying", "err", err, "backoff", backoff)
 		select {
 		case <-ctx.Done():
@@ -102,10 +95,8 @@ func (c *Consumer) write(ctx context.Context, events []Event) (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	defer tx.Rollback(ctx)
+	defer func() { _ = tx.Rollback(ctx) }() // no-op once Commit succeeds
 
-	// Stage the batch, then do insert-dedupe-aggregate as set operations in
-	// SQL: one round trip per step instead of one per event.
 	if _, err := tx.Exec(ctx, `CREATE TEMP TABLE batch (LIKE usage_events) ON COMMIT DROP`); err != nil {
 		return 0, err
 	}

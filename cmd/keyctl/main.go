@@ -18,7 +18,6 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"llmgateway/internal/auth"
-	"llmgateway/internal/config"
 	"llmgateway/migrations"
 )
 
@@ -50,11 +49,8 @@ func main() {
 		capUSD := fs.Float64("cap", 0, "monthly spend cap in USD (0 = none)")
 		strategy := fs.String("strategy", "", "default routing strategy for this key")
 		_ = fs.Parse(os.Args[2:])
-		if *name == "" {
-			fail("-name is required")
-		}
-		if *strategy != "" && !config.ValidStrategy(*strategy) {
-			fail("unknown strategy " + *strategy)
+		if err := validateCreateFlags(*name, *rps, *burst, *capUSD, *strategy); err != nil {
+			fail(err.Error())
 		}
 		plain, hash := auth.Generate()
 		id := auth.NewID()
@@ -71,19 +67,25 @@ func main() {
 			fail(err.Error())
 		}
 		tw := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-		fmt.Fprintln(tw, "ID\tNAME\tRPS\tBURST\tCAP_USD\tSTRATEGY\tCREATED\tREVOKED")
+		if _, err := fmt.Fprintln(tw, "ID\tNAME\tRPS\tBURST\tCAP_USD\tSTRATEGY\tCREATED\tREVOKED"); err != nil {
+			fail(err.Error())
+		}
 		for rows.Next() {
-			var id, name, strat string
+			var id, name, strategy string
 			var rps, capUSD float64
 			var burst int
 			var created time.Time
 			var revoked bool
-			if err := rows.Scan(&id, &name, &rps, &burst, &capUSD, &strat, &created, &revoked); err != nil {
+			if err := rows.Scan(&id, &name, &rps, &burst, &capUSD, &strategy, &created, &revoked); err != nil {
 				fail(err.Error())
 			}
-			fmt.Fprintf(tw, "%s\t%s\t%g\t%d\t%g\t%s\t%s\t%v\n", id, name, rps, burst, capUSD, strat, created.Format(time.DateTime), revoked)
+			if _, err := fmt.Fprintf(tw, "%s\t%s\t%g\t%d\t%g\t%s\t%s\t%v\n", id, name, rps, burst, capUSD, strategy, created.Format(time.DateTime), revoked); err != nil {
+				fail(err.Error())
+			}
 		}
-		tw.Flush()
+		if err := tw.Flush(); err != nil {
+			fail(err.Error())
+		}
 	case "revoke":
 		fs := flag.NewFlagSet("revoke", flag.ExitOnError)
 		id := fs.String("id", "", "key id")

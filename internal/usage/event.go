@@ -1,5 +1,4 @@
-// Package usage emits one event per request to Kafka and (in the consumer)
-// aggregates them into Postgres.
+// Package usage emits per-request events to Kafka and aggregates them into Postgres.
 package usage
 
 import (
@@ -8,7 +7,6 @@ import (
 	"time"
 )
 
-// Event is the wire format (JSON) on the usage topic.
 type Event struct {
 	EventID      string    `json:"event_id"` // UUIDv4, the dedupe key downstream
 	TS           time.Time `json:"ts"`
@@ -36,7 +34,6 @@ func NewEventID() string {
 	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:])
 }
 
-// Sink receives events. The gateway uses a Kafka producer or a no-op.
 type Sink interface {
 	Emit(e Event)
 	Close()

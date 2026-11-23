@@ -1,5 +1,4 @@
--- API keys. Only the SHA-256 of the key is stored; the plaintext is shown
--- once at creation and never again, so a database leak doesn't leak keys.
+-- API keys: only SHA-256 of the key is stored, plaintext shown once.
 CREATE TABLE IF NOT EXISTS api_keys (
     id               TEXT PRIMARY KEY,
     key_hash         BYTEA NOT NULL UNIQUE,
@@ -12,10 +11,7 @@ CREATE TABLE IF NOT EXISTS api_keys (
     revoked_at       TIMESTAMPTZ
 );
 
--- Raw events, used for deduplication: delivery is at-least-once, so the same
--- event can arrive twice (producer retry, consumer restart before offset
--- commit). event_id as primary key makes the second insert a no-op.
--- Production: partition by day and drop partitions after the dedupe window.
+-- Raw events; event_id PK dedupes at-least-once Kafka delivery.
 CREATE TABLE IF NOT EXISTS usage_events (
     event_id      UUID PRIMARY KEY,
     ts            TIMESTAMPTZ NOT NULL,

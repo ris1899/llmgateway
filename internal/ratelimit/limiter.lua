@@ -1,21 +1,10 @@
 -- Token bucket + monthly spend cap, checked atomically in one round trip.
---
--- KEYS[1] = bucket hash (fields: tokens, ts)
--- KEYS[2] = monthly spend counter, in nano-USD (integer)
--- ARGV[1] = refill rate, tokens per second
--- ARGV[2] = burst (bucket capacity)
--- ARGV[3] = monthly cap in nano-USD (0 = no cap)
---
--- Returns {code, retry_after_ms}: code 1 = allowed, 0 = rate limited,
--- -1 = over spend cap.
---
--- Why Lua: read-refill-decrement must be atomic. With separate GET/SET calls,
--- two gateway replicas can both read "1 token left" and both allow. Redis runs
--- a script without interleaving other commands, so no locks are needed.
---
--- Why Redis TIME instead of a timestamp from the gateway: clocks on different
--- gateway replicas drift. One shared clock (Redis) keeps refill math
--- consistent no matter which replica handles the request.
+-- KEYS: 1=bucket hash (tokens,ts), 2=monthly spend counter (nano-USD)
+-- ARGV: 1=refill rate/s, 2=burst, 3=monthly cap nano-USD (0=none)
+-- Returns {code, retry_after_ms}: 1=allowed, 0=rate limited, -1=over cap.
+-- Lua for atomicity: separate GET/SET would let two replicas both read
+-- "1 token left" and both allow. Redis TIME, not gateway time, since
+-- replica clocks drift and refill math needs one shared clock.
 
 local rate  = tonumber(ARGV[1])
 local burst = tonumber(ARGV[2])

@@ -1,10 +1,4 @@
-// Package metrics registers every Prometheus metric in one place, so the full
-// list (and its label cardinality) can be reviewed at a glance.
-//
-// Cardinality rule: labels are only bounded sets (model group, deployment,
-// status). Never API key ids or request ids: each unique label value is a new
-// time series, and per-key labels at 10k keys would blow up Prometheus memory.
-// Per-key accounting lives in the Kafka → Postgres usage pipeline instead.
+// Package metrics registers every Prometheus metric in one place. Labels are bounded sets only, never key/request ids.
 package metrics
 
 import (
@@ -34,8 +28,6 @@ type Metrics struct {
 	ActiveStreams  prometheus.Gauge
 }
 
-// Buckets tuned for what we measure: overhead in the 0.1-50ms range,
-// request latency from cache hits (~1ms) to long generations (~60s).
 var (
 	overheadBuckets = []float64{.0001, .00025, .0005, .001, .002, .003, .005, .01, .025, .05}
 	latencyBuckets  = []float64{.001, .003, .005, .01, .025, .05, .1, .25, .5, 1, 2.5, 5, 10, 30, 60}
