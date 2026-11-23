@@ -1,26 +1,8 @@
 # llmgateway
 
-An LLM gateway in Go. One OpenAI-compatible API in front of multiple providers
-(OpenAI, Anthropic, any OpenAI-compatible endpoint), with **cost- and
-latency-aware routing and measured failover** as the headline feature.
-
-```
-            ┌──────────────────────────── llmgateway ────────────────────────────┐
- client ──► │ request id → auth (keys) → rate limit + spend cap ──┐               │
- (OpenAI    │                              (Redis Lua, atomic)    ▼               │
-  SDK/curl) │                                             cache lookup (Redis)    │
-            │                                                     │ miss          │
-            │   router: strategy (priority / fastest / cheapest / weighted)       │
-            │     uses live stats per deployment: base latency p95, time/token,   │
-            │     error rate, circuit breaker state                               │
-            │                                                     ▼               │
-            │   attempts: breaker gate → retry budget → optional hedge ──────────►│──► OpenAI-compatible
-            │   SSE streaming, failover until first token                         │──► Anthropic
-            │                                                     │               │──► mock providers
-            │   usage event ─► Kafka (Redpanda) ─► consumer ─► Postgres           │
-            │   metrics ─► Prometheus ─► Grafana                                   │
-            └─────────────────────────────────────────────────────────────────────┘
-```
+An LLM gateway in Go. One OpenAI-compatible API in front of multiple
+providers (OpenAI, Anthropic, any OpenAI-compatible endpoint). Headline
+feature: cost- and latency-aware routing with measured failover.
 
 ## Quick start (no API keys, no dependencies)
 
@@ -55,36 +37,42 @@ make down
 
 ## Routing
 
-A **model group** is a public model name backed by interchangeable deployments
-(provider + upstream model + price). Strategy is the group default, overridable
-per API key, overridable per request with `X-Gateway-Strategy`:
+A model group is a public model name backed by interchangeable deployments
+(provider + upstream model + price). Strategy is the group default,
+overridable per API key or per request with `X-Gateway-Strategy`:
 
 | Strategy | Picks | Uses |
 |---|---|---|
-| `priority` | configured order, fail over down the list | — |
+| `priority` | configured order, fail over down the list | none |
 | `fastest` | lowest predicted latency | base-latency p95 + expected tokens × time-per-token, inflated by error rate |
 | `cheapest` | cheapest deployment predicted to meet `X-Gateway-Latency-Target-Ms` | price per token × estimated tokens, plus the latency prediction |
 | `weighted` | random split by weight, rest as fallbacks | canaries, A/B |
 
-Reliability, per deployment: circuit breaker (consecutive failures or error
-rate, half-open probes), "no progress" timeout, retry budget (retries capped at
-~20% of traffic, so they can't cause a storm), optional hedged requests.
-How it all fits together, with diagrams: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
-Why each choice was made: [DECISIONS.md](DECISIONS.md).
+Diagrams and request flow: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+
+## Design choices
+
+- Failover only before the first streamed token. After that the client has
+  seen output, so a provider dying mid-stream ends the stream with an error.
+- One circuit breaker per (model group, deployment). It trips on consecutive
+  failures or on error rate, and probes one request at a time to recover.
+- Retries and hedges are capped at about 20% of traffic, so a slow provider
+  can't trigger a retry storm. Failing over away from an open breaker is free.
+- Only the provider's faults count against its health: a 400 or a 404 for a
+  misconfigured model fails over (404) or fails fast (400) without tripping
+  the breaker.
+- Redis-backed features (cache, rate limits, sessions) fail open: if Redis is
+  down, requests are still served.
+- Usage billing is exactly-once in effect: events are deduped on `event_id`
+  in Postgres, and Kafka offsets are committed only after the transaction.
 
 ## Benchmarks
 
-All numbers below come from scripted runs on one machine. Raw results are in
-`bench/results/`. Reproduce with the commands shown.
+Scripted runs on one Apple Silicon laptop, gateway/mocks/loadgen all native.
+Raw results in `bench/results/`; mocks have fixed 50 ms latency, so these
+numbers are about gateway overhead, not real-provider performance.
 
-**Setup:** Apple Silicon Mac laptop. Gateway, mocks and load generator all
-run natively on the same machine (not in Colima), so they compete for CPU.
-Mock providers have a fixed 50 ms latency. Open-model load (constant arrival
-rate). These numbers come from mocks, not real providers.
-
-### Failover: mock-a broken for 20 s of a 60 s run at 500 rps
-
-`MODE=<kill|error|hang> RPS=500 ./bench/failover.sh`
+### Failover: mock-a broken for 20 s of a 60 s run at 500 rps (`MODE=<kill|error|hang> RPS=500 ./bench/failover.sh`)
 
 | Fault on primary | Requests | Errors | p99 | Degraded seconds | Back on primary after restore |
 |---|---|---|---|---|---|
@@ -92,58 +80,22 @@ rate). These numbers come from mocks, not real providers.
 | Every request returns 503 | 29,996 | 0 | 61.6 ms | 0 | 0 s |
 | Hangs (never answers) | 29,977 | 0 | 2,051.8 ms | 2 | 3 s |
 
-What this shows:
-- **Zero client-visible errors** in all three modes.
-- When the provider fails fast (killed, or returning 503), failover costs nothing
-  noticeable: the failed attempt returns in about 1 ms and the circuit breaker
-  opens after 5 consecutive failures.
-- **A hang is different:** no error ever comes back, so the first requests each
-  wait the full provider timeout (2 s in this config) before failing over.
-  For about 2 seconds, p99 equals the timeout. Then the breaker opens and
-  latency returns to normal. **For hangs, recovery time ≈ the provider timeout**,
-  so that timeout is the knob that matters.
-- Before the circuit breaker existed, *every* request paid the full timeout for
-  as long as the provider hung.
+Zero client-visible errors in all three modes; a hang costs the full
+provider timeout until the breaker opens, so that timeout is the knob that
+matters.
 
-### Verified against real providers
-
-`./bench/live-test.sh` (config in `config.local.yaml`, keys from env vars).
-One run on 2026-11-22 against **Groq** (`openai/gpt-oss-20b`) and **Google
-Gemini** (`gemini-flash-lite-latest`), free tiers, about 20 requests. This
-checks correctness, not performance. Raw output:
-`bench/results/live-20261122-133628.txt`.
+### Verified against real providers (`./bench/live-test.sh`, free tiers, ~20 requests, 2026-11-22)
 
 | Check | Result |
 |---|---|
 | Non-streaming call, each provider | 200 from both (Groq 786 ms, Gemini 2,562 ms upstream) |
 | SSE streaming (Groq) | 15 `data:` events, ended with `[DONE]` |
-| Failover: Gemini made unreachable (1 ms timeout), Groq as fallback | **7 of 7 requests returned 200** from Groq, `Attempts: 2`; Gemini's breaker ended `open` |
-| `fastest` strategy | Groq for 5 of 6 requests (measured p50 747 ms); the 6th went to Gemini because it had too few samples to rank yet (new deployments are tried optimistically) |
+| Failover: Gemini made unreachable (1 ms timeout), Groq as fallback | 7 of 7 requests returned 200 from Groq, `Attempts: 2`; Gemini's breaker ended `open` |
+| `fastest` strategy | Groq for 5 of 6 requests (measured p50 747 ms); 6th went to Gemini (too few samples to rank yet) |
 
-What this shows and what it doesn't:
-- The OpenAI-compatible adapter works against two real APIs, including streaming.
-- Failover between two real providers is invisible to the client. Failover
-  requests took 570–672 ms upstream, within the range of direct Groq calls
-  (616–952 ms) in the same run; with this few requests, Groq's own variance
-  dominates.
-- In this run every failover request showed `Attempts: 2`, because requests
-  were spaced longer than the breaker's 2 s cooldown, so each one was a
-  half-open probe. The script now sends them back to back.
-- **Not covered:** the Anthropic adapter (no key; tested against a mock only),
-  `cheapest` (free tier, so all prices are 0), and any load or throughput.
-
-### Not yet measured (run these to fill)
-
-| Measurement | Command |
-|---|---|
-| Throughput and latency at 500..5000 rps, gateway vs direct | `./bench/run-baseline.sh` (needs `brew install k6`) |
-| Cache hit vs miss latency | `./bench/cache.sh` (needs Redis on :6379) |
-| Streaming TTFT overhead, and 10k concurrent streams | `./bench/streaming.sh` (raise `ulimit -n` first; see bench/README.md) |
-| Grafana screenshot | `make up`, generate load, screenshot `http://localhost:3000` |
-
-What's already been seen informally, not benchmarked: per-request gateway
-overhead (`X-Gateway-Overhead-Ms`) stayed around 0.1 ms at p99 during the
-failover runs. Note that header is measured before the response is encoded.
+Failover between two real providers is invisible to the client (570-672 ms
+vs 616-952 ms direct, same run). Not covered: Anthropic adapter (no key),
+`cheapest` (free tier, prices are 0), load/throughput.
 
 ## API
 
@@ -154,59 +106,49 @@ failover runs. Note that header is measured before the response is encoded.
 | `GET /healthz`, `GET /readyz` | liveness vs readiness |
 | `:8081/metrics`, `:8081/admin/deployments`, `:8081/debug/pprof` | internal port only |
 
-Request headers: `Authorization: Bearer <key>` (when auth is on),
-`X-Gateway-Strategy`, `X-Gateway-Latency-Target-Ms`, `X-Gateway-No-Cache: true`,
-`X-Gateway-Session: <conversation id>` (sticky routing: keeps a conversation on
-one provider so its prompt cache is reused, D34).
+Request headers: `Authorization: Bearer <key>`, `X-Gateway-Strategy`,
+`X-Gateway-Latency-Target-Ms`, `X-Gateway-No-Cache: true`,
+`X-Gateway-Session: <conversation id>` (sticky routing: keeps a conversation
+on one provider so its prompt cache is reused).
 
 Response headers: `X-Gateway-Provider`, `-Attempts`, `-Upstream-Ms`,
-`-Overhead-Ms`, `-Cost-Usd`, `-Cache` (hit/miss/skip), `-Hedged`, `-Sticky` (new/hit/moved).
+`-Overhead-Ms`, `-Cost-Usd`, `-Cache` (hit/miss/skip), `-Hedged`, `-Sticky`
+(new/hit/moved), also set on error responses where at least one deployment
+was tried.
 
-Not supported (rejected with 400, never silently dropped): tools/function
-calling, images, `n > 1`.
+Unknown request body fields get 400 `unsupported parameter: <name>`, not
+silently dropped (`seed`, `frequency_penalty`, `logit_bias`,
+`response_format`, etc.); `tools`/`functions`, images and `n > 1` are
+rejected the same way (text-only).
 
-## Breaking a provider live
+## Development
 
 ```bash
-curl -X PATCH localhost:9001/admin/behavior -d '{"error_rate":1,"error_status":503}'
-curl -X PATCH localhost:9001/admin/behavior -d '{"fault":"hang"}'
-curl -X PATCH localhost:9001/admin/behavior -d '{"fault":"reset"}'
-curl -X PATCH localhost:9001/admin/behavior -d '{"fail_after_tokens":3}'   # die mid-stream
-curl -X PATCH localhost:9001/admin/behavior -d '{"fault":"","error_rate":0,"fail_after_tokens":0}'
-curl -s localhost:8081/admin/deployments | jq    # breaker state, live stats
+make test    # go test -race ./...
+make lint    # golangci-lint run
+make cover   # coverage profile + summary
+make ci      # fmt-check, vet, build, test, lint -- what CI runs
 ```
+
+Unit/e2e tests cover router, breaker, gateway pipeline, API/SSE, request
+validation, provider adapters, auth. Anything needing real Redis/Kafka/
+Postgres (the rate-limit Lua script, cache round trips, the usage consumer)
+was verified manually.
+
+## Known limitations
+
+- A hung provider can't be detected faster than its timeout.
+- Spend caps are soft: in-flight requests can overshoot, and a request that
+  spans a UTC month boundary can be billed to the next month.
+- Usage events still buffered in memory are lost on `SIGKILL`.
+- Text only: tools, images and `n > 1` are rejected.
+- Config is read at startup; changes need a restart.
+- The Anthropic adapter is tested against a mock, not the real API.
+- Kubernetes manifests in `deploy/k8s` have never been applied to a cluster.
+- Not built: native Gemini adapter, config hot reload, semantic caching.
 
 ## Real providers
 
 Copy `config.real.example.yaml` to `config.local.yaml` (gitignored). Fill in
-model ids and current prices from each provider's pricing page, and export the
-API keys as env vars. Keys are never stored in config.
-
-## Kubernetes
-
-`deploy/k8s/`: Deployment (2 replicas, readiness/liveness, drain delay),
-Service, PDB, HPA, mocks, Redis. See [deploy/k8s/README.md](deploy/k8s/README.md)
-for running it on Colima's built-in k3s.
-
-## Layout
-
-```
-cmd/gateway         main + wiring config to objects
-cmd/mockprovider    fake provider (OpenAI + Anthropic wire formats)
-cmd/keyctl          create/list/revoke API keys
-cmd/usageconsumer   Kafka → Postgres aggregation
-internal/llm        canonical types and error kinds (leaf package)
-internal/config     YAML loading + validation
-internal/provider   Provider interface, HTTP client, deadlines, SSE reader; openai/, anthropic/
-internal/router     stats, circuit breaker, retry budget, strategies
-internal/gateway    pipeline: cache → plan → attempts (failover, hedging) → record
-internal/api        HTTP handlers, SSE, auth/limit middleware
-internal/cache      Redis exact-match cache
-internal/ratelimit  token bucket + spend cap (Lua)
-internal/auth       hashed API keys
-internal/usage      Kafka producer, consumer
-internal/metrics    all Prometheus metrics
-migrations/         Postgres schema
-deploy/             Dockerfile, compose, Grafana, Prometheus, k8s
-bench/              loadgen, k6, failover/cache/streaming scripts, results/
-```
+model ids and current prices, export API keys as env vars; never stored in
+config.

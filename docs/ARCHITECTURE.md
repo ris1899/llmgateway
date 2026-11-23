@@ -1,7 +1,7 @@
 # Architecture
 
-How the pieces fit together. For *why* each choice was made, see
-[DECISIONS.md](../DECISIONS.md); the `D<n>` references below point there.
+How the pieces fit together. The main design choices are summarized in the
+[README](../README.md#design-choices).
 
 ## 1. The system at a glance
 
@@ -24,13 +24,13 @@ flowchart LR
     GF["Grafana"] --> PR
 ```
 
-Every box except the gateway and the providers is **optional**: leave its config
-section out and the feature is off (D32). `make run` needs none of them.
+Every box except the gateway and the providers is optional: leave its config
+section out and the feature is off.
 
 ## 2. Inside the gateway: layers
 
-Each layer only calls the one below it. `llm` is the shared vocabulary and
-imports nothing, which keeps the dependency graph free of cycles (D1).
+Each layer only calls the one below it; `llm` is the shared vocabulary and
+imports nothing, keeping the dependency graph free of cycles.
 
 ```mermaid
 flowchart TB
@@ -68,7 +68,7 @@ flowchart TB
 |---|---|---|---|
 | api | yes (client side) | no | no |
 | gateway | no | through the interface only | indirectly |
-| router | no | no | **never**: pure decisions on in-memory state |
+| router | no | no | never: pure decisions on in-memory state |
 | provider | yes (upstream side) | yes, one each | yes |
 
 ## 3. One request, step by step (non-streaming)
@@ -86,7 +86,7 @@ sequenceDiagram
     participant P2 as provider B
 
     C->>A: POST /v1/chat/completions
-    A->>A: auth, rate limit, decode, validate
+    A->>A: auth, rate limit, decode + validate (field allowlist)
     A->>G: Chat(req, policy)
     G->>Ca: Get(key) [only if temperature ≤ max]
     Ca-->>G: miss
@@ -105,122 +105,74 @@ sequenceDiagram
     G-->>A: Result (deployment, attempts, upstream time)
     A-->>C: 200 + X-Gateway-* headers
     A->>A: finish(): metrics, spend, usage event
+
+    Note over G,A: If every attempt fails, the error is wrapped in a<br/>gateway.Failure (attempts, last deployment, hedged?) so the<br/>error response and usage event still show routing history.
 ```
 
-| Step | File, function |
-|---|---|
-| 1–2 | `internal/api/auth.go` `withAuth`, `internal/api/chat.go` `handleChat` |
-| 3–5 | `internal/gateway/gateway.go` `Chat` |
-| 6–7 | `internal/router/router.go` `Plan` |
-| 8–17 | `internal/gateway/gateway.go` `chatUpstream`, `recordAttempt` |
-| 10, 15 | `internal/provider/openai/openai.go` `Chat`, `internal/provider/http.go` `Do` |
-| 20 | `internal/api/chat.go` `finish` |
-
-**Hedging** (optional, per model group, D26): if attempt A hasn't answered after
-`hedge_after`, attempt B starts in parallel. The first success wins; the loser
-is cancelled and recorded as neutral.
+Hedging (optional per group): if attempt A hasn't answered after
+`hedge_after`, attempt B starts in parallel; the loser is cancelled and
+recorded as neutral.
 
 ## 4. Choosing a provider: the router
 
-```mermaid
-flowchart LR
-    D["all deployments<br/>in the model group"] --> F{"breaker<br/>allows?"}
-    F -->|no| X["dropped from plan"]
-    F -->|yes| S["score each one<br/>(stats snapshot)"]
-    S --> ST{"strategy"}
-    ST -->|priority| O1["configured order"]
-    ST -->|fastest| O2["lowest predicted latency"]
-    ST -->|cheapest| O3["cheapest that meets<br/>latency target"]
-    ST -->|weighted| O4["random by weight"]
-    O1 & O2 & O3 & O4 --> PL["ordered plan<br/>= failover order"]
-```
+Strategies rank deployments whose breaker allows traffic: `priority` uses
+configured order, `fastest` picks lowest predicted latency, `cheapest`
+picks cheapest meeting `X-Gateway-Latency-Target-Ms`, `weighted` splits
+randomly. Predicted latency = base latency p95 + expected tokens × time per
+token, divided by (1 − error rate).
 
-**Sticky routing** (D34): with `X-Gateway-Session: <id>`, the deployment that
-served the conversation's last turn is moved to the front of the plan, so
-multi-turn chats keep the provider's prompt cache. It never overrides health:
-an open breaker removes the deployment from the plan first.
-
-**Predicted latency** = base latency p95 + expected output tokens × time per
-token, divided by (1 − error rate) (D22). Strategy comes from, in priority
-order: the `X-Gateway-Strategy` header, then the API key's default, then the
-model group's default.
+Sticky routing: with `X-Gateway-Session: <id>`, the deployment that
+served the conversation's last turn moves to the front of the plan, unless
+its breaker is open.
 
 ## 5. Circuit breaker states
 
-One breaker per (model group, deployment) (D24).
+One breaker per (model group, deployment).
 
 ```mermaid
 stateDiagram-v2
     [*] --> Closed
     Closed --> Open: 5 consecutive failures<br/>OR ≥50% errors over ≥20 requests
-    Open --> HalfOpen: cooldown (2s) passed and a request arrives
+    Open --> HalfOpen: cooldown passed (5s default, 2s in config.example.yaml)<br/>and a request arrives
     HalfOpen --> Closed: 3 probe successes in a row
     HalfOpen --> Open: probe fails
     note right of HalfOpen: one probe at a time
+    note right of Closed: error-rate window is reset<br/>on HalfOpen → Closed
 ```
 
-Only failures that are the provider's fault count (timeouts, 5xx, 429,
-connection errors). Bad requests and client disconnects don't (D4).
-
-**Retry budget** (D25): failovers and hedges together are capped at about 20%
-of traffic. Failing over *away from an open breaker* is free, which is why a
-single dead provider causes no errors.
+Only failures that are the provider's fault count toward the breaker
+(`CountsAsFailure()`): Timeout, Unavailable, RateLimited, Auth, Unknown.
+BadRequest, ContentFilter, Canceled and NotFound never count. Retry budget:
+failovers and hedges together are capped at about 20% of traffic;
+failing over away from an already-open breaker is free.
 
 ## 6. Streaming
 
-```mermaid
-sequenceDiagram
-    participant C as Client
-    participant A as api (sse.go)
-    participant G as gateway
-    participant P as provider
+Commit point: the gateway reads the first real chunk from upstream before
+the API layer writes response headers, so failover before the first token
+is invisible to the client. After the first token, a failure ends the
+stream with an SSE `{"error":...}` event and no `[DONE]`. A client
+disconnect cancels the upstream request; a silent provider trips the
+"no progress" deadline, counted as a timeout.
 
-    C->>A: stream: true
-    A->>G: ChatStream()
-    G->>P: open stream
-    P-->>G: first token
-    Note over G: commit point: until here,<br/>failover is invisible to the client
-    G-->>A: Stream (first chunk buffered)
-    A-->>C: 200, text/event-stream
-    loop each token
-        P-->>G: chunk
-        G-->>A: Recv()
-        A-->>C: data: {...} + flush
-    end
-    A-->>C: data: [DONE]
-```
+## 7. Usage pipeline
 
-| Situation | Behaviour |
-|---|---|
-| Provider fails **before** the first token | Silent failover to the next provider (D16) |
-| Provider fails **after** the first token | `data: {"error":...}`, stream ends without `[DONE]` (D17) |
-| Client disconnects | Upstream request is cancelled, so no more tokens are billed |
-| Provider goes silent | "No progress" deadline fires, which counts as a timeout (D15) |
-
-## 7. Usage pipeline: at-least-once in, exactly-once effect out
-
-```mermaid
-flowchart LR
-    G["gateway finish()"] -->|"non-blocking<br/>TryProduce"| K[["Kafka topic<br/>llm-usage"]]
-    K --> C["usage consumer"]
-    C --> T["one Postgres transaction:<br/>1. COPY batch to temp table<br/>2. INSERT events ON CONFLICT DO NOTHING<br/>3. aggregate only new rows into usage_daily"]
-    T -->|"after commit"| O["commit Kafka offsets"]
-```
-
-A crash anywhere means the batch is redelivered, and duplicate event IDs are
-ignored, so totals stay correct (D30). Verified by replaying the topic from
+`gateway finish()` does a non-blocking produce to a Kafka topic; the usage
+consumer aggregates each batch into Postgres in one transaction (insert
+new rows, aggregate, commit, then commit Kafka offsets), so a crash just
+causes a harmless redelivery. Verified by replaying the topic from
 offset 0.
 
 ## 8. What happens when a dependency is down
 
-| Down | Effect | Why |
-|---|---|---|
-| One provider | Traffic moves to the others; breaker opens | core feature (D24) |
-| All providers in a group | Fast 503 `no_healthy_upstream` | waiting on known-dead providers helps nobody |
-| Redis | Cache skipped, limits not enforced (fail open), 5s backoff | availability over strictness (D27, D28) |
-| Postgres | Cached keys keep working; new keys get 503 | (D29) |
-| Kafka | Events buffered in memory, then dropped and counted when the buffer is full | billing data must not block serving (D30) |
-| Usage consumer | Kafka holds the backlog; nothing lost | separate binary (D30) |
+| Down | Effect |
+|---|---|
+| One provider | Traffic moves to the others; breaker opens |
+| All providers in a group | Fast 503 `no_healthy_upstream` |
+| Redis | Cache skipped, limits fail open, 5s backoff |
+| Postgres | Cached keys keep working; uncached keys fail fast for 5s as 503, never 401 |
+| Kafka | Events buffered, then dropped and counted if full |
+| Usage consumer | Kafka holds the backlog; nothing lost |
 
 ## 9. Ports and binaries
 
@@ -229,14 +181,18 @@ offset 0.
 | `cmd/gateway` | :8080 | public API |
 | | :8081 | `/metrics`, `/admin/deployments`, `/debug/pprof` (internal only) |
 | `cmd/mockprovider` | :9001–9003 | fake providers, `PATCH /admin/behavior` |
-| `cmd/usageconsumer` | — | Kafka → Postgres |
-| `cmd/keyctl` | — | create / list / revoke API keys |
+| `cmd/usageconsumer` | none | Kafka → Postgres |
+| `cmd/keyctl` | none | create / list / revoke API keys |
+
+Error responses carry the same routing headers as success responses when
+something was tried (`X-Gateway-Attempts`, `-Provider`, `-Hedged`); a
+request that failed before any attempt carries none of these.
 
 ## 10. Known limits
 
-- A **hung** provider can't be detected faster than its timeout: the first
-  requests each wait the full timeout (measured: about 2s at p99 with a 2s timeout).
-- Spend caps are soft: in-flight requests can overshoot (D28).
-- Usage events still in memory are lost on SIGKILL (D30).
+- A hung provider can't be detected faster than its timeout (measured: about 2s at p99 with a 2s timeout).
+- Spend caps are soft: in-flight requests can overshoot.
+- Usage events still in memory are lost on SIGKILL.
 - Text only: tools, images and `n > 1` are rejected with 400.
 - Config is read once at startup; changes need a restart.
+- The monthly spend cap's window uses the gateway's local clock, and the check and the charge can run minutes apart, so a request spanning a UTC month boundary is billed to the wrong month. At most one request per boundary; accepted since the cap is already soft.
