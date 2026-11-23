@@ -1,7 +1,5 @@
-# Same feature set as config.compose-noauth.yaml, but pointed at in-cluster
-# service names. Auth/Kafka are left off here to keep this manifest set
-# self-contained (no Postgres/Redpanda StatefulSets to run) - only redis.yaml
-# is included as a minimal dependency.
+# mirrors config.compose-noauth.yaml, pointed at in-cluster service names;
+# auth/Kafka left off so this manifest set stays self-contained (redis.yaml only)
 apiVersion: v1
 kind: ConfigMap
 metadata:

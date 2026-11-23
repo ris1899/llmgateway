@@ -1,0 +1,32 @@
+version: "2"
+
+linters:
+  default: none
+  enable:
+    - errcheck
+    - govet
+    - staticcheck
+    - unused
+    - ineffassign
+    - misspell # catches typos in comments/log messages before they ship
+    - bodyclose # unclosed response bodies leak connections under load
+    - errorlint # %w / errors.Is-Is misuse, easy to get wrong with errors.Join
+  settings:
+    staticcheck:
+      checks:
+        - all
+  exclusions:
+    generated: lax
+    rules:
+      # table-driven tests shadow/ignore some errors on purpose; keep errcheck on prod code
+      - path: _test\.go
+        linters:
+          - errcheck
+
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0
+
+formatters:
+  enable:
+    - gofmt

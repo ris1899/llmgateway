@@ -11,10 +11,28 @@ spec:
   template:
     metadata: { labels: { app: redis } }
     spec:
+      # uid 999 matches what the alpine entrypoint drops to anyway via gosu
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 999
       containers:
         - name: redis
           image: redis:7-alpine
           ports: [{ containerPort: 6379 }]
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: { drop: ["ALL"] }
+          resources:
+            requests: { cpu: 50m, memory: 32Mi }
+            limits: { cpu: 250m, memory: 128Mi }
+          readinessProbe:
+            tcpSocket: { port: 6379 }
+            periodSeconds: 5
+            failureThreshold: 3
+          livenessProbe:
+            tcpSocket: { port: 6379 }
+            periodSeconds: 10
+            failureThreshold: 3
 ---
 apiVersion: v1
 kind: Service

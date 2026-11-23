@@ -9,12 +9,29 @@ spec:
   template:
     metadata: { labels: { app: mock-a } }
     spec:
+      securityContext:
+        runAsNonRoot: true
       containers:
         - name: mock-a
           image: llmgateway-mock:latest
           imagePullPolicy: IfNotPresent
           args: ["-addr", ":9001", "-name", "mock-a"]
           ports: [{ containerPort: 9001 }]
+          securityContext:
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities: { drop: ["ALL"] }
+          resources:
+            requests: { cpu: 50m, memory: 32Mi }
+            limits: { cpu: 250m, memory: 64Mi }
+          readinessProbe:
+            httpGet: { path: /healthz, port: 9001 }
+            periodSeconds: 5
+            failureThreshold: 3
+          livenessProbe:
+            httpGet: { path: /healthz, port: 9001 }
+            periodSeconds: 10
+            failureThreshold: 3
 ---
 apiVersion: v1
 kind: Service
@@ -36,12 +53,29 @@ spec:
   template:
     metadata: { labels: { app: mock-b } }
     spec:
+      securityContext:
+        runAsNonRoot: true
       containers:
         - name: mock-b
           image: llmgateway-mock:latest
           imagePullPolicy: IfNotPresent
           args: ["-addr", ":9002", "-name", "mock-b"]
           ports: [{ containerPort: 9002 }]
+          securityContext:
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities: { drop: ["ALL"] }
+          resources:
+            requests: { cpu: 50m, memory: 32Mi }
+            limits: { cpu: 250m, memory: 64Mi }
+          readinessProbe:
+            httpGet: { path: /healthz, port: 9002 }
+            periodSeconds: 5
+            failureThreshold: 3
+          livenessProbe:
+            httpGet: { path: /healthz, port: 9002 }
+            periodSeconds: 10
+            failureThreshold: 3
 ---
 apiVersion: v1
 kind: Service

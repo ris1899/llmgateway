@@ -4,8 +4,6 @@ providers:
   - name: llmgateway
     folder: ""
     type: file
-    # Re-read the dashboard file every 10s so edits during development show
-    # up without restarting Grafana.
-    updateIntervalSeconds: 10
+    updateIntervalSeconds: 10 # re-read so dev edits show up without a restart
     options:
       path: /var/lib/grafana/dashboards

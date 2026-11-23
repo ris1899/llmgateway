@@ -6,6 +6,4 @@ datasources:
     access: proxy
     url: http://prometheus:9090
     isDefault: true
-    # Fixed uid so the dashboard JSON can reference it without a provisioning
-    # lookup step.
-    uid: prometheus
+    uid: prometheus # fixed so the dashboard JSON can reference it directly

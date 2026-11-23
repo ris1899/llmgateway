@@ -30,15 +30,15 @@ spec:
             - { name: http, containerPort: 8080 }
             - { name: metrics, containerPort: 8081 }
           env:
-            # Delay before the gateway starts shutting down on SIGTERM, so the
-            # endpoint has time to leave kube-proxy/Service routing before new
-            # connections stop being accepted - avoids a race where traffic
-            # keeps arriving after the pod decides it's draining.
+            # time for the endpoint to leave Service routing before we stop
+            # accepting new connections; stays well under terminationGracePeriodSeconds
             - { name: GATEWAY_DRAIN_DELAY, value: "5s" }
           volumeMounts:
             - { name: config, mountPath: /etc/llmgateway, readOnly: true }
           securityContext:
             readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities: { drop: ["ALL"] }
           resources:
             requests: { cpu: 500m, memory: 128Mi }
             limits: { cpu: "2", memory: 512Mi }

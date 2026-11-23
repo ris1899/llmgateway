@@ -1,6 +1,4 @@
-# Without a PDB, a node drain or cluster upgrade can evict both replicas at
-# once and drop the gateway to zero. minAvailable: 1 forces evictions to
-# happen one pod at a time.
+# without this, a node drain could evict both replicas at once and drop to zero
 apiVersion: policy/v1
 kind: PodDisruptionBudget
 metadata:

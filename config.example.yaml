@@ -1,7 +1,5 @@
-# Minimal local config: mock providers only, no Redis/Kafka/Postgres, so it
-# runs with zero API keys and zero dependencies. Infrastructure features are
-# off because their sections are absent (see config.bench.yaml and
-# deploy/config.compose.yaml for the full setup).
+# Minimal local config: mock providers only, zero API keys, zero deps.
+# See deploy/config.compose.yaml for the full setup.
 
 server:
   addr: ":8080"
